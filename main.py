@@ -27,7 +27,7 @@ DRY_RUN = os.getenv("DRY_RUN", "0") == "1"  # build + simulate only; don't send
 if not ETH_NODE_URL or not PRIVATE_KEY or not FLASHBOTS_KEY:
     raise RuntimeError("Missing ETH_NODE_URL, PRIVATE_KEY or FLASHBOTS_KEY in environment.")
 
-w3 = Web3(Web3.WebsocketProvider(ETH_NODE_URL.replace('https://mainnet.infura.io/v3/', 'wss://mainnet.infura.io/ws/v3/')))
+w3 = Web3(Web3.WebsocketProvider(ETH_NODE_URL))
 
 # Accounts
 searcher = Account.from_key(PRIVATE_KEY)
@@ -213,13 +213,14 @@ def main():
         try:
             global tx_processed_count, uniswap_detected_count, ev_passed_count
             
+            # Print stats every 30 seconds regardless of queue state
+            if time.time() - last_stats_time > 30:
+                print(f"[stats] Received: {tx_received_count}, Processed: {tx_processed_count}, Uniswap: {uniswap_detected_count}, EV Passed: {ev_passed_count}")
+                last_stats_time = time.time()
+            
             try:
                 tx_hash = pending_tx_queue.get(timeout=0.2)
             except queue.Empty:
-                # Print stats every 30 seconds
-                if time.time() - last_stats_time > 30:
-                    print(f"[stats] Received: {tx_received_count}, Processed: {tx_processed_count}, Uniswap: {uniswap_detected_count}, EV Passed: {ev_passed_count}")
-                    last_stats_time = time.time()
                 continue
 
             tx_processed_count += 1
@@ -250,7 +251,17 @@ def main():
                 continue
                 
             uniswap_detected_count += 1
-            print(f"[uniswap] Found swap tx: {tx_hash}")
+            # Debug: Show transaction details to understand what we're detecting
+            to_addr = tx.to.lower() if hasattr(tx.to, 'lower') else Web3.to_checksum_address(tx.to).lower()
+            if isinstance(tx.input, bytes):
+                input_hex = tx.input.hex().lower()
+            else:
+                input_hex = tx.input.lower()
+                if input_hex.startswith('0x'):
+                    input_hex = input_hex[2:]
+            sig = "0x" + input_hex[:8]
+            value_eth = Web3.from_wei(tx.value or 0, "ether") if tx.value else 0
+            print(f"[uniswap] Found swap tx: {tx_hash} | To: {to_addr[-6:]} | Sig: {sig} | Value: {value_eth:.4f} ETH")
 
             # 1) EV gate (quick pre-check, conservative)
             try:
@@ -318,6 +329,15 @@ def main():
 
             time.sleep(0.05)  # avoid busy spin
         except Exception as outer:
+            error_msg = str(outer).lower()
+            # Skip common value overflow errors silently
+            if any(phrase in error_msg for phrase in [
+                "value must be between",
+                "invalid literal for int",
+                "overflow",
+                "out of range"
+            ]):
+                continue  # Skip silently
             print(f"[loop error] {outer}")
             time.sleep(1.0)
 
