@@ -281,17 +281,92 @@ def decode_swap_intent(w3: Web3, tx) -> Optional[SwapIntent]:
         except Exception:
             pass
 
-    # Universal/unknown: heuristic
+    # Universal Router: try to decode commands (signature 0x3593564c)
+    if to == UNIVERSAL_ROUTER and s4 == "0x3593564c":
+        try:
+            # Universal router has commands and inputs arrays
+            # For ETH swaps, WETH is typically involved, look for common tokens
+            if int(tx.value or 0) > 0:
+                # This is an ETH->token swap, fallback to USDC for now
+                return SwapIntent(
+                    token_in=WETH9, 
+                    token_out=USDC, 
+                    amount_in_wei=int(tx.value), 
+                    kind="universal"
+                )
+        except Exception:
+            pass
+    
+    # V3 Periphery multicall (signature 0x5ae401dc)  
+    if to == UNISWAP_V3_PERIPH and s4 == "0x5ae401dc":
+        try:
+            # Try to find actual tokens in the multicall data instead of defaulting to USDC
+            addrs = _scan_addresses_from_calldata(data_hex)
+            
+            if int(tx.value or 0) > 0:
+                # ETH->token swap - find the target token
+                token_in = WETH9
+                token_out = None
+                
+                # Look for a token that's not WETH
+                for addr in addrs:
+                    if (addr != WETH9 and addr != UNISWAP_V3_PERIPH and 
+                        not addr.endswith("0000000000000000000000000000000000000000") and
+                        len(addr) == 42 and addr.startswith("0x")):
+                        token_out = addr
+                        break
+                        
+                # Fallback to USDC if no other token found
+                if not token_out:
+                    token_out = USDC
+                    
+                return SwapIntent(
+                    token_in=token_in,
+                    token_out=token_out,
+                    amount_in_wei=int(tx.value),
+                    kind="universal"
+                )
+        except Exception:
+            pass
+
+    # Universal/unknown: enhanced heuristic with fallback
     addrs = _scan_addresses_from_calldata(data_hex)
     token_in, token_out = None, None
     if int(tx.value or 0) > 0:
         token_in = WETH9
+        # Look for valid, non-zero addresses that are NOT WETH
         for a in addrs:
-            if a != WETH9:
-                token_out = a; break
+            if (a != WETH9 and 
+                not a.endswith("0000000000000000000000000000000000000000") and
+                len(a) == 42 and a.startswith("0x")):
+                token_out = a
+                break
     else:
-        if len(addrs) >= 2 and addrs[0] != addrs[1]:
-            token_in, token_out = addrs[0], addrs[1]
+        # For token->token swaps, find two different valid addresses
+        valid_addrs = [a for a in addrs if (
+            not a.endswith("0000000000000000000000000000000000000000") and
+            len(a) == 42 and a.startswith("0x") and a != WETH9
+        )]
+        if len(valid_addrs) >= 2 and valid_addrs[0] != valid_addrs[1]:
+            token_in, token_out = valid_addrs[0], valid_addrs[1]
+    
+    # If we still don't have token_out, try common patterns
+    if not token_out and int(tx.value or 0) > 0:
+        # For ETH swaps, try to find any token address that's not WETH
+        common_tokens = [USDC, "0xdac17f958d2ee523a2206206994597c13d831ec7"]  # USDT
+        for common in common_tokens:
+            if common.lower() in data_hex:
+                token_out = common
+                break
+        
+        # Last resort: if we have ETH value but no token_out, assume USDC
+        if not token_out:
+            token_out = USDC
+    
+    # Final check: ensure token_in and token_out are different
+    if token_in and token_out and token_in.lower() == token_out.lower():
+        token_out = USDC
+            
     amt_in = int(tx.value or 0) if token_in in (None, WETH9) else None
     kind = "universal" if token_out else "unknown"
     return SwapIntent(token_in, token_out, amt_in, kind=kind)
@@ -396,44 +471,61 @@ def estimate_ev_universal_wei(
     priority_fee_gwei: int = 1,
 ) -> Optional[Tuple[int, int, int, int]]:
     """Route-agnostic EV estimator. Returns (ev_wei, gas_wei, my_eth_in, est_back)."""
-    if not victim_tx.to:
+    try:
+        if not victim_tx.to:
+            return None
+
+        max_fee, _ = _get_base_and_fees(w3, priority_fee_gwei)
+        intent = decode_swap_intent(w3, victim_tx)
+        if not intent or not intent.token_out:
+            return None
+
+        victim_eth_in = int(victim_tx.value or 0)
+        victim_amount_in = int(intent.amount_in_wei or victim_eth_in or 0)
+        if victim_amount_in <= 0:
+            victim_amount_in = Web3.to_wei(0.1, "ether")
+        my_eth_in = max(Web3.to_wei(0.02, "ether"), (victim_amount_in * buy_portion_bps) // 10_000)
+        my_eth_in = min(my_eth_in, Web3.to_wei(1.2, "ether"))
+
+        token = intent.token_out        
+        best_back = 0
+
+        quoter = w3.eth.contract(address=UNISWAP_V3_QUOTERV2, abi=QUOTER_V2_ABI)
+
+        # Try V3 direct route
+        v3_direct = _try_v3_direct_roundtrip(w3, quoter, my_eth_in, token)
+        if v3_direct: 
+            best_back = max(best_back, v3_direct)
+        
+        # Try V3 two-hop route
+        v3_twohop = _try_v3_twohop_roundtrip(w3, quoter, my_eth_in, token)
+        if v3_twohop: 
+            best_back = max(best_back, v3_twohop)
+
+        # Try V2 routes
+        for v2r in UNISWAP_V2_ROUTERS:
+            b = _try_v2_roundtrip(w3, v2r, my_eth_in, token)
+            if b: 
+                best_back = max(best_back, b)
+            
+            b2 = _try_v2_roundtrip_twohop(w3, v2r, my_eth_in, token)
+            if b2: 
+                best_back = max(best_back, b2)
+
+        if best_back <= 0:
+            return None
+
+        gas_bundle = 65_000 + 70_000 + 250_000 + 70_000 + 250_000
+        gas_wei = gas_bundle * max_fee
+        ev_wei = best_back - my_eth_in - gas_wei
+        
+        # Don't return negative EV - it causes "value must be between" errors  
+        if ev_wei <= 0:
+            return None
+            
+        return ev_wei, gas_wei, my_eth_in, best_back
+    except Exception:
         return None
-
-    max_fee, _ = _get_base_and_fees(w3, priority_fee_gwei)
-    intent = decode_swap_intent(w3, victim_tx)
-    if not intent or not intent.token_out:
-        return None
-
-    victim_eth_in = int(victim_tx.value or 0)
-    victim_amount_in = int(intent.amount_in_wei or victim_eth_in or 0)
-    if victim_amount_in <= 0:
-        victim_amount_in = Web3.to_wei(0.1, "ether")
-    my_eth_in = max(Web3.to_wei(0.02, "ether"), (victim_amount_in * buy_portion_bps) // 10_000)
-    my_eth_in = min(my_eth_in, Web3.to_wei(1.2, "ether"))
-
-    token = intent.token_out
-    best_back = 0
-
-    quoter = w3.eth.contract(address=UNISWAP_V3_QUOTERV2, abi=QUOTER_V2_ABI)
-
-    v3_direct = _try_v3_direct_roundtrip(w3, quoter, my_eth_in, token)
-    if v3_direct: best_back = max(best_back, v3_direct)
-    v3_twohop = _try_v3_twohop_roundtrip(w3, quoter, my_eth_in, token)
-    if v3_twohop: best_back = max(best_back, v3_twohop)
-
-    for v2r in UNISWAP_V2_ROUTERS:
-        b = _try_v2_roundtrip(w3, v2r, my_eth_in, token)
-        if b: best_back = max(best_back, b)
-        b2 = _try_v2_roundtrip_twohop(w3, v2r, my_eth_in, token)
-        if b2: best_back = max(best_back, b2)
-
-    if best_back <= 0:
-        return None
-
-    gas_bundle = 65_000 + 70_000 + 250_000 + 70_000 + 250_000
-    gas_wei = gas_bundle * max_fee
-    ev_wei = best_back - my_eth_in - gas_wei
-    return ev_wei, gas_wei, my_eth_in, best_back
 
 # --------- Sandwich bundle builder (simple V3 single-hop) ----------
 def build_sandwich_bundle(

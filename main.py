@@ -117,7 +117,13 @@ def main():
 
             print(f"[mempool] {describe_tx(tx)}")
 
-            # Strict estimator, then universal fallback
+            # Check if transaction is worth processing
+            intent = decode_swap_intent(w3, tx)
+            if not intent or not intent.token_out:
+                ev_missed += 1
+                continue
+
+            # Strict estimator, then universal fallback  
             res = estimate_ev_wei(w3, tx, priority_fee_gwei=1)
             if res is None:
                 res = estimate_ev_universal_wei(w3, tx, buy_portion_bps=300, priority_fee_gwei=1)
