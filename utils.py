@@ -10,25 +10,71 @@ UNISWAP_V3_ROUTER   = Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E015
 UNISWAP_V3_PERIPH   = Web3.to_checksum_address("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")  # v3 periphery
 UNISWAP_V3_QUOTERV2 = Web3.to_checksum_address("0x61fFE014bA17989E743c5F6cB21bF9697530B21e")
 UNIVERSAL_ROUTER    = Web3.to_checksum_address("0xEf1c6E67703c7BD7107eed8303Fbe6EC2554BF6B")
+
+# Sushiswap
+SUSHISWAP_V2_ROUTER = Web3.to_checksum_address("0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F")
+SUSHISWAP_V3_ROUTER = Web3.to_checksum_address("0x2E6cd2d30aa43f40aa81619ff4b6E0a41479B13f")  # SushiV3Router
+SUSHISWAP_ROUTER_V2 = Web3.to_checksum_address("0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506")  # SushiRouterV2
+
+# 0x Protocol
+ZEROX_EX_V3         = Web3.to_checksum_address("0xDef1C0ded9bec7F1a1670819833240f027b25EfF")  # 0x Exchange Proxy v3
+ZEROX_EX_V4         = Web3.to_checksum_address("0xDef1C0ded9bec7F1a1670819833240f027b25EfF")  # Same address for v4
+
+# Curve
+CURVE_ROUTER        = Web3.to_checksum_address("0xfA9a30350048B2BF66865ee20363067c66f67e58")  # Curve.fi Router v1.0
+CURVE_TRICRYPTO     = Web3.to_checksum_address("0x80466c64868E1ab14a1Ddf27A676C3fcBE638Fe5")  # TriCrypto2 Pool
+
+# Balancer
+BALANCER_VAULT      = Web3.to_checksum_address("0xBA12222222228d8Ba445958a75a0704d566BF2C8")
+
+# Aggregators and other DEXs
 ONEINCH_V5          = Web3.to_checksum_address("0x1111111254EEB25477B68fb85Ed929f73A960582")
-ZEROX_EX            = Web3.to_checksum_address("0xDef1C0ded9bec7F1a1670819833240f027b25EfF")  # 0x Exchange Proxy
-PARASWAP            = Web3.to_checksum_address("0xDEF171Fe48CF0115B1d80b88dc8eAB59176FEe57")
+ONEINCH_V6          = Web3.to_checksum_address("0x111111125421cA6dc452d289314280a0f8842A65")  # 1inch v6
+PARASWAP_V5         = Web3.to_checksum_address("0xDEF171Fe48CF0115B1d80b88dc8eAB59176FEe57")
+PARASWAP_V6         = Web3.to_checksum_address("0x216B4B4Ba9F3e719726886d34a177484278Bfcae")  # ParaSwap v6
+COW_PROTOCOL        = Web3.to_checksum_address("0x9008D19f58AAbD9eD0D60971565AA8510560ab41")  # CoW Protocol Settlement
+MATCHA              = Web3.to_checksum_address("0xDef1C0ded9bec7F1a1670819833240f027b25EfF")  # 0x-based
+
+# Token addresses
 WETH9               = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
 USDC                = Web3.to_checksum_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606EB48")
+USDT                = Web3.to_checksum_address("0xdAC17F958D2ee523a2206206994597C13D831ec7")
+DAI                 = Web3.to_checksum_address("0x6B175474E89094C44Da98b954EedeAC495271d0F")
 
 KNOWN_ROUTERS: Dict[str, str] = {
     UNISWAP_V2_ROUTER: "Uniswap V2",
     UNISWAP_V3_ROUTER: "Uniswap V3",
     UNISWAP_V3_PERIPH: "Uniswap V3 Periphery",
     UNIVERSAL_ROUTER:  "Uniswap Universal Router",
+    SUSHISWAP_V2_ROUTER: "Sushiswap V2",
+    SUSHISWAP_V3_ROUTER: "Sushiswap V3",
+    SUSHISWAP_ROUTER_V2: "Sushiswap Router V2", 
     ONEINCH_V5:        "1inch v5",
-    ZEROX_EX:          "0x Exchange",
-    PARASWAP:          "ParaSwap",
+    ONEINCH_V6:        "1inch v6",
+    ZEROX_EX_V3:       "0x Exchange v3",
+    ZEROX_EX_V4:       "0x Exchange v4",
+    PARASWAP_V5:       "ParaSwap v5",
+    PARASWAP_V6:       "ParaSwap v6",
+    CURVE_ROUTER:      "Curve Router",
+    CURVE_TRICRYPTO:   "Curve TriCrypto",
+    BALANCER_VAULT:    "Balancer Vault",
+    COW_PROTOCOL:      "CoW Protocol",
+    MATCHA:            "Matcha (0x)",
 }
 
 UNISWAP_V2_ROUTERS = {UNISWAP_V2_ROUTER}
 UNISWAP_V3_ROUTERS = {UNISWAP_V3_ROUTER, UNISWAP_V3_PERIPH}
-ONEINCH_ROUTERS    = {ONEINCH_V5}
+SUSHISWAP_V2_ROUTERS = {SUSHISWAP_V2_ROUTER, SUSHISWAP_ROUTER_V2}
+SUSHISWAP_V3_ROUTERS = {SUSHISWAP_V3_ROUTER}
+ONEINCH_ROUTERS    = {ONEINCH_V5, ONEINCH_V6}
+ZEROX_ROUTERS      = {ZEROX_EX_V3, ZEROX_EX_V4, MATCHA}
+PARASWAP_ROUTERS   = {PARASWAP_V5, PARASWAP_V6}
+CURVE_ROUTERS      = {CURVE_ROUTER, CURVE_TRICRYPTO}
+BALANCER_ROUTERS   = {BALANCER_VAULT}
+COW_ROUTERS        = {COW_PROTOCOL}
+
+# All V2-like routers that use the same ABI
+ALL_V2_ROUTERS = UNISWAP_V2_ROUTERS | SUSHISWAP_V2_ROUTERS
 
 # --------- ABIs (minimal) ---------
 UNISWAP_V2_ROUTER_ABI = [
@@ -221,8 +267,8 @@ def decode_swap_intent(w3: Web3, tx) -> Optional[SwapIntent]:
     data_hex = _hex_input(tx)
     s4 = "0x" + data_hex[:8]
 
-    # v2
-    if to in UNISWAP_V2_ROUTERS:
+    # v2 (Uniswap and Sushiswap use same ABI)
+    if to in ALL_V2_ROUTERS:
         router = w3.eth.contract(address=to, abi=UNISWAP_V2_ROUTER_ABI)
         try:
             fn, args = router.decode_function_input(tx.input)
@@ -231,11 +277,17 @@ def decode_swap_intent(w3: Web3, tx) -> Optional[SwapIntent]:
             amt_in = None
             if "amountIn" in args: amt_in = int(args["amountIn"])
             elif name.startswith("swapExactETHFor"): amt_in = int(tx.value or 0)
+            
+            # Determine DEX type
+            dex_kind = "v2"
+            if to in SUSHISWAP_V2_ROUTERS:
+                dex_kind = "sushiswap_v2"
+                
             return SwapIntent(
                 token_in=path[0] if path else None,
                 token_out=path[-1] if path else None,
                 amount_in_wei=amt_in,
-                kind="v2", path_v2=path
+                kind=dex_kind, path_v2=path
             )
         except Exception:
             pass
@@ -909,8 +961,8 @@ def estimate_ev_universal_wei(
         if v3_twohop: 
             best_back = max(best_back, v3_twohop)
 
-        # Try V2 routes
-        for v2r in UNISWAP_V2_ROUTERS:
+        # Try V2 routes (Uniswap and Sushiswap)
+        for v2r in ALL_V2_ROUTERS:
             b = _try_v2_roundtrip(w3, v2r, my_eth_in, token)
             if b: 
                 best_back = max(best_back, b)
