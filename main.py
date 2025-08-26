@@ -18,6 +18,7 @@ from utils import (
     is_uniswap_swap,
     estimate_ev_wei,
     estimate_ev_universal_wei,
+    estimate_ev_dynamic_wei,
     decode_swap_intent,
     build_sandwich_bundle,
     describe_tx,
@@ -125,9 +126,13 @@ def main():
                 ev_missed += 1
                 continue
 
-            # Strict estimator, then universal fallback  
-            res = estimate_ev_wei(w3, tx, priority_fee_gwei=1)
+            # Try dynamic sizing first (most advanced), then fallback to other methods
+            res = estimate_ev_dynamic_wei(w3, tx, priority_fee_gwei=1)
             if res is None:
+                # Fallback to strict estimator
+                res = estimate_ev_wei(w3, tx, priority_fee_gwei=1)
+            if res is None:
+                # Final fallback to universal estimator
                 res = estimate_ev_universal_wei(w3, tx, buy_portion_bps=300, priority_fee_gwei=1)
 
             if res is None:

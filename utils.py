@@ -644,6 +644,186 @@ def is_token_blacklisted(token: str) -> bool:
     
     return token in blacklisted_tokens
 
+# --------- Pool liquidity and sizing helpers ----------
+def get_pool_liquidity_depth(w3: Web3, token_a: str, token_b: str) -> Dict[str, int]:
+    """
+    Get liquidity depth across different DEX pools for optimal sizing.
+    Returns dict with pool info: {'v2_liquidity': int, 'v3_500': int, 'v3_3000': int, 'v3_10000': int}
+    """
+    liquidity_info = {
+        'v2_liquidity': 0,
+        'v3_500': 0,
+        'v3_3000': 0,  
+        'v3_10000': 0,
+        'total_liquidity': 0
+    }
+    
+    try:
+        # Check V2 liquidity
+        router = w3.eth.contract(address=UNISWAP_V2_ROUTER, abi=UNISWAP_V2_ROUTER_ABI)
+        test_amount = Web3.to_wei(1, "ether")  # Test with 1 ETH
+        try:
+            amounts = router.functions.getAmountsOut(test_amount, [token_a, token_b]).call()
+            if len(amounts) >= 2 and amounts[-1] > 0:
+                # Estimate liquidity depth by testing progressively larger amounts
+                for multiplier in [1, 5, 10]:
+                    test_larger = test_amount * multiplier
+                    try:
+                        larger_amounts = router.functions.getAmountsOut(test_larger, [token_a, token_b]).call()
+                        if len(larger_amounts) >= 2:
+                            # If we can still get reasonable output, pool has depth
+                            expected_output = amounts[-1] * multiplier
+                            actual_output = larger_amounts[-1]
+                            # If actual output is > 80% of expected, good liquidity
+                            if actual_output > (expected_output * 8) // 10:
+                                liquidity_info['v2_liquidity'] = test_larger
+                            else:
+                                break
+                    except Exception:
+                        break
+        except Exception:
+            pass
+        
+        # Check V3 liquidity for different fee tiers
+        quoter = w3.eth.contract(address=UNISWAP_V3_QUOTERV2, abi=QUOTER_V2_ABI)
+        for fee in [500, 3000, 10000]:
+            try:
+                test_amount = Web3.to_wei(1, "ether")
+                result = quoter.functions.quoteExactInputSingle(token_a, token_b, fee, test_amount, 0).call()
+                if result[0] > 0:
+                    # Test deeper liquidity
+                    for multiplier in [1, 3, 5, 10]:
+                        test_larger = test_amount * multiplier
+                        try:
+                            larger_result = quoter.functions.quoteExactInputSingle(token_a, token_b, fee, test_larger, 0).call()
+                            if larger_result[0] > 0:
+                                expected_output = result[0] * multiplier
+                                actual_output = larger_result[0]
+                                # Check for reasonable price impact (< 20%)
+                                if actual_output > (expected_output * 8) // 10:
+                                    liquidity_info[f'v3_{fee}'] = test_larger
+                                else:
+                                    break
+                        except Exception:
+                            break
+            except Exception:
+                continue
+        
+        # Calculate total available liquidity
+        liquidity_info['total_liquidity'] = max(
+            liquidity_info['v2_liquidity'],
+            liquidity_info['v3_500'], 
+            liquidity_info['v3_3000'],
+            liquidity_info['v3_10000']
+        )
+        
+    except Exception:
+        pass
+        
+    return liquidity_info
+
+def calculate_optimal_position_size(
+    w3: Web3, 
+    victim_tx, 
+    intent: SwapIntent,
+    liquidity_info: Dict[str, int]
+) -> int:
+    """
+    Calculate optimal sandwich position size based on:
+    1. Victim transaction size
+    2. Pool liquidity depth  
+    3. Price impact analysis
+    4. Risk management limits
+    """
+    try:
+        victim_eth_in = int(victim_tx.value or 0)
+        victim_amount_in = int(intent.amount_in_wei or victim_eth_in or 0)
+        
+        if victim_amount_in <= 0:
+            victim_amount_in = Web3.to_wei(0.1, "ether")
+            
+        # Base sizing: start with percentage of victim amount
+        base_size = victim_amount_in // 20  # 5% of victim
+        
+        # Adjust based on victim transaction size
+        if victim_amount_in >= Web3.to_wei(10, "ether"):
+            # Large victim -> smaller relative size to avoid excessive price impact
+            base_size = victim_amount_in // 50  # 2% of large victims
+        elif victim_amount_in <= Web3.to_wei(0.1, "ether"):
+            # Small victim -> larger relative size for better profit margins  
+            base_size = max(base_size, Web3.to_wei(0.05, "ether"))  # Min 0.05 ETH
+        
+        # Adjust based on pool liquidity
+        total_liquidity = liquidity_info.get('total_liquidity', 0)
+        if total_liquidity > 0:
+            # Size as percentage of available liquidity (max 5% of pool liquidity)
+            liquidity_based_size = total_liquidity // 20
+            
+            # Take the smaller of victim-based and liquidity-based sizing
+            base_size = min(base_size, liquidity_based_size)
+            
+            # For very deep liquidity, can be more aggressive
+            if total_liquidity >= Web3.to_wei(100, "ether"):
+                base_size = min(base_size * 2, Web3.to_wei(2, "ether"))
+        
+        # Apply absolute limits
+        min_size = Web3.to_wei(0.02, "ether")  # Minimum viable size
+        max_size = Web3.to_wei(3, "ether")     # Maximum risk limit
+        
+        # Ensure we don't exceed victim size (would be obvious)
+        max_size = min(max_size, victim_amount_in)
+        
+        optimal_size = max(min_size, min(base_size, max_size))
+        
+        return int(optimal_size)
+        
+    except Exception:
+        # Fallback to conservative sizing
+        return Web3.to_wei(0.05, "ether")
+
+def estimate_price_impact(w3: Web3, token_in: str, token_out: str, amount_in: int) -> float:
+    """
+    Estimate price impact of a swap to optimize position sizing.
+    Returns price impact as a decimal (0.01 = 1%)
+    """
+    try:
+        quoter = w3.eth.contract(address=UNISWAP_V3_QUOTERV2, abi=QUOTER_V2_ABI)
+        
+        # Get quote for small amount (baseline price)
+        small_amount = amount_in // 100  # 1% of actual amount
+        if small_amount == 0:
+            small_amount = Web3.to_wei(0.01, "ether")
+            
+        best_baseline_rate = 0
+        best_actual_rate = 0
+        
+        # Check across fee tiers for best rates
+        for fee in [500, 3000, 10000]:
+            try:
+                # Baseline rate
+                small_result = quoter.functions.quoteExactInputSingle(token_in, token_out, fee, small_amount, 0).call()
+                if small_result[0] > 0:
+                    baseline_rate = small_result[0] / small_amount
+                    best_baseline_rate = max(best_baseline_rate, baseline_rate)
+                
+                # Actual rate
+                actual_result = quoter.functions.quoteExactInputSingle(token_in, token_out, fee, amount_in, 0).call()
+                if actual_result[0] > 0:
+                    actual_rate = actual_result[0] / amount_in
+                    best_actual_rate = max(best_actual_rate, actual_rate)
+                    
+            except Exception:
+                continue
+        
+        if best_baseline_rate > 0 and best_actual_rate > 0:
+            price_impact = (best_baseline_rate - best_actual_rate) / best_baseline_rate
+            return max(0, price_impact)  # Ensure non-negative
+            
+    except Exception:
+        pass
+    
+    return 0.0  # Default to no impact if calculation fails
+
 # --------- Gas helpers ----------
 def _get_base_and_fees(w3: Web3, priority_gwei: int) -> Tuple[int, int]:
     base = w3.eth.gas_price  # simple approximation; for 1559 blocks you could sample baseFee
@@ -748,6 +928,104 @@ def estimate_ev_universal_wei(
         
         # Don't return negative EV - it causes "value must be between" errors  
         if ev_wei <= 0:
+            return None
+            
+        return ev_wei, gas_wei, my_eth_in, best_back
+    except Exception:
+        return None
+
+# --------- Dynamic EV estimator with optimal sizing ----------
+def estimate_ev_dynamic_wei(
+    w3: Web3,
+    victim_tx,
+    *,
+    priority_fee_gwei: int = 1,
+) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Advanced EV estimator with dynamic position sizing based on pool liquidity and price impact.
+    Returns (ev_wei, gas_wei, my_eth_in, est_back) or None.
+    """
+    try:
+        if not victim_tx.to:
+            return None
+
+        max_fee, _ = _get_base_and_fees(w3, priority_fee_gwei)
+        intent = decode_swap_intent(w3, victim_tx)
+        if not intent or not intent.token_out:
+            return None
+
+        token_in = intent.token_in or WETH9
+        token_out = intent.token_out
+
+        # Get pool liquidity information for optimal sizing
+        liquidity_info = get_pool_liquidity_depth(w3, token_in, token_out)
+        
+        # Calculate optimal position size
+        optimal_size = calculate_optimal_position_size(w3, victim_tx, intent, liquidity_info)
+        
+        # Estimate price impact for the optimal size
+        price_impact = estimate_price_impact(w3, token_in, token_out, optimal_size)
+        
+        # If price impact is too high (>15%), reduce position size
+        if price_impact > 0.15:
+            optimal_size = int(optimal_size * 0.7)  # Reduce by 30%
+            
+        # Re-check with reduced size if needed
+        if optimal_size < Web3.to_wei(0.02, "ether"):
+            return None  # Too small to be profitable
+            
+        my_eth_in = optimal_size
+        token = token_out        
+        best_back = 0
+
+        quoter = w3.eth.contract(address=UNISWAP_V3_QUOTERV2, abi=QUOTER_V2_ABI)
+
+        # Try V3 routes with dynamic fee selection based on liquidity
+        fee_priority = []
+        if liquidity_info.get('v3_3000', 0) > liquidity_info.get('v3_500', 0):
+            fee_priority = [3000, 500, 10000]
+        elif liquidity_info.get('v3_500', 0) > 0:
+            fee_priority = [500, 3000, 10000]
+        else:
+            fee_priority = [3000, 10000, 500]
+
+        # Try V3 direct route with prioritized fees
+        for fee in fee_priority:
+            try:
+                out = quoter.functions.quoteExactInputSingle(token_in, token_out, fee, my_eth_in, 0).call()[0]
+                back = quoter.functions.quoteExactInputSingle(token_out, token_in, fee, out, 0).call()[0]
+                if back > best_back:
+                    best_back = back
+            except Exception:
+                continue
+        
+        # Try V3 two-hop route if direct route isn't great
+        if best_back < my_eth_in * 1.01:  # Less than 1% profit
+            v3_twohop = _try_v3_twohop_roundtrip(w3, quoter, my_eth_in, token)
+            if v3_twohop:
+                best_back = max(best_back, v3_twohop)
+
+        # Try V2 routes if V2 liquidity is better
+        if liquidity_info.get('v2_liquidity', 0) > liquidity_info.get('total_liquidity', 0) * 0.3:
+            for v2r in UNISWAP_V2_ROUTERS:
+                b = _try_v2_roundtrip(w3, v2r, my_eth_in, token)
+                if b:
+                    best_back = max(best_back, b)
+                
+                b2 = _try_v2_roundtrip_twohop(w3, v2r, my_eth_in, token)
+                if b2:
+                    best_back = max(best_back, b2)
+
+        if best_back <= 0:
+            return None
+
+        gas_bundle = 65_000 + 70_000 + 250_000 + 70_000 + 250_000
+        gas_wei = gas_bundle * max_fee
+        ev_wei = best_back - my_eth_in - gas_wei
+        
+        # Higher profit threshold for dynamic sizing (should be more profitable)
+        min_profit_threshold = Web3.to_wei(0.005, "ether")  # Min 0.005 ETH profit
+        if ev_wei <= min_profit_threshold:
             return None
             
         return ev_wei, gas_wei, my_eth_in, best_back
@@ -884,6 +1162,8 @@ __all__ = [
     "WETH9", "USDC",
     "KNOWN_ROUTERS", "get_router_name", "describe_tx",
     "UNISWAP_V2_ROUTER_ABI", "UNISWAP_V3_ROUTER_ABI", "QUOTER_V2_ABI", "ERC20_ABI", "WETH9_ABI",
-    "is_uniswap_swap", "estimate_ev_wei", "estimate_ev_universal_wei",
+    "is_uniswap_swap", "estimate_ev_wei", "estimate_ev_universal_wei", "estimate_ev_dynamic_wei",
     "decode_swap_intent", "build_sandwich_bundle", "sig4",
+    "validate_token_liquidity", "is_token_blacklisted",
+    "get_pool_liquidity_depth", "calculate_optimal_position_size", "estimate_price_impact",
 ]
