@@ -284,37 +284,172 @@ def decode_swap_intent(w3: Web3, tx) -> Optional[SwapIntent]:
     # Universal Router: try to decode commands (signature 0x3593564c)
     if to == UNIVERSAL_ROUTER and s4 == "0x3593564c":
         try:
-            # Universal router has commands and inputs arrays
-            # For ETH swaps, WETH is typically involved, look for common tokens
+            # Parse Universal Router execute function
+            # execute(bytes commands, bytes[] inputs, uint256 deadline)
+            data_bytes = bytes.fromhex(data_hex)
+            
+            # Skip function selector (first 4 bytes)
+            params_data = data_bytes[4:]
+            
+            # Try to extract token addresses from the inputs
+            token_addresses = []
+            
+            # Scan for token addresses in the calldata
+            for i in range(0, len(params_data) - 20):
+                potential_addr = "0x" + params_data[i:i+20].hex()
+                try:
+                    addr = Web3.to_checksum_address(potential_addr)
+                    # Filter for likely token addresses (not zero, not router itself)
+                    if (not addr.endswith("0000000000000000000000000000000000000000") and 
+                        addr != UNIVERSAL_ROUTER and addr != WETH9 and 
+                        len(addr) == 42):
+                        token_addresses.append(addr)
+                except Exception:
+                    continue
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_tokens = []
+            for addr in token_addresses:
+                if addr not in seen:
+                    seen.add(addr)
+                    unique_tokens.append(addr)
+            
             if int(tx.value or 0) > 0:
-                # This is an ETH->token swap, fallback to USDC for now
+                # ETH->token swap
+                token_in = WETH9
+                token_out = None
+                
+                # Find the most likely output token
+                # Priority: first non-WETH token found
+                for addr in unique_tokens:
+                    if addr != WETH9:
+                        token_out = addr
+                        break
+                
+                # If no token found, check for common tokens in hex data
+                if not token_out:
+                    common_tokens = [
+                        USDC,
+                        "0xdAC17F958D2ee523a2206206994597C13D831ec7",  # USDT
+                        "0x6B175474E89094C44Da98b954EedeAC495271d0F",  # DAI
+                        "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",  # WBTC
+                    ]
+                    for token in common_tokens:
+                        if token.lower().replace("0x", "") in data_hex:
+                            token_out = token
+                            break
+                
+                # Last resort fallback
+                if not token_out:
+                    token_out = USDC
+                    
                 return SwapIntent(
-                    token_in=WETH9, 
-                    token_out=USDC, 
-                    amount_in_wei=int(tx.value), 
+                    token_in=token_in,
+                    token_out=token_out,
+                    amount_in_wei=int(tx.value),
                     kind="universal"
                 )
+            else:
+                # Token->token or token->ETH swap
+                if len(unique_tokens) >= 2:
+                    # Take first two distinct tokens
+                    token_in = unique_tokens[0]
+                    token_out = unique_tokens[1] if unique_tokens[1] != token_in else (unique_tokens[2] if len(unique_tokens) > 2 else WETH9)
+                    
+                    return SwapIntent(
+                        token_in=token_in,
+                        token_out=token_out,
+                        amount_in_wei=None,  # Can't determine from Universal Router easily
+                        kind="universal"
+                    )
+                    
         except Exception:
             pass
     
     # V3 Periphery multicall (signature 0x5ae401dc)  
     if to == UNISWAP_V3_PERIPH and s4 == "0x5ae401dc":
         try:
-            # Try to find actual tokens in the multicall data instead of defaulting to USDC
-            addrs = _scan_addresses_from_calldata(data_hex)
+            # Enhanced multicall parsing for V3 Periphery
+            data_bytes = bytes.fromhex(data_hex)
+            
+            # Try to decode multicall structure
+            # multicall(bytes[] data) or multicall(uint256 deadline, bytes[] data)
+            
+            # Scan for token addresses with improved filtering
+            potential_tokens = []
+            
+            # Look for exactInputSingle function calls (0x414bf389)
+            exact_input_single_sig = "414bf389"
+            if exact_input_single_sig in data_hex:
+                # Find positions of exactInputSingle calls
+                pos = 0
+                while True:
+                    pos = data_hex.find(exact_input_single_sig, pos)
+                    if pos == -1:
+                        break
+                    
+                    # Extract tokens from exactInputSingle parameters
+                    # Parameters: tokenIn, tokenOut, fee, recipient, deadline, amountIn, amountOutMinimum, sqrtPriceLimitX96
+                    try:
+                        param_start = pos + 8  # Skip function signature
+                        if param_start + 128 <= len(data_hex):  # Ensure we have enough data for 2 addresses (64 chars each)
+                            token_in_hex = data_hex[param_start:param_start+64]
+                            token_out_hex = data_hex[param_start+64:param_start+128]
+                            
+                            # Extract addresses (last 40 chars of each 64-char parameter)
+                            token_in_addr = "0x" + token_in_hex[-40:]
+                            token_out_addr = "0x" + token_out_hex[-40:]
+                            
+                            for addr_hex in [token_in_addr, token_out_addr]:
+                                try:
+                                    addr = Web3.to_checksum_address(addr_hex)
+                                    if not addr.endswith("0000000000000000000000000000000000000000"):
+                                        potential_tokens.append(addr)
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
+                    
+                    pos += 8
+            
+            # Also scan generally for addresses
+            general_addrs = _scan_addresses_from_calldata(data_hex)
+            
+            # Filter addresses to likely tokens
+            likely_tokens = []
+            excluded_addrs = {UNISWAP_V3_PERIPH, UNISWAP_V3_ROUTER, UNIVERSAL_ROUTER}
+            
+            for addr in potential_tokens + general_addrs:
+                if (addr not in excluded_addrs and 
+                    not addr.endswith("0000000000000000000000000000000000000000") and
+                    len(addr) == 42 and addr.startswith("0x")):
+                    if addr not in likely_tokens:  # Avoid duplicates
+                        likely_tokens.append(addr)
             
             if int(tx.value or 0) > 0:
-                # ETH->token swap - find the target token
+                # ETH->token swap
                 token_in = WETH9
                 token_out = None
                 
-                # Look for a token that's not WETH
-                for addr in addrs:
-                    if (addr != WETH9 and addr != UNISWAP_V3_PERIPH and 
-                        not addr.endswith("0000000000000000000000000000000000000000") and
-                        len(addr) == 42 and addr.startswith("0x")):
+                # Priority: tokens found in exactInputSingle calls first
+                for addr in likely_tokens:
+                    if addr != WETH9:
                         token_out = addr
                         break
+                
+                # Check for common tokens if nothing found
+                if not token_out:
+                    common_tokens = [
+                        USDC,
+                        "0xdAC17F958D2ee523a2206206994597C13D831ec7",  # USDT
+                        "0x6B175474E89094C44Da98b954EedeAC495271d0F",  # DAI
+                        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",  # USDC (duplicate check)
+                    ]
+                    for token in common_tokens:
+                        if token.lower().replace("0x", "") in data_hex:
+                            token_out = token
+                            break
                         
                 # Fallback to USDC if no other token found
                 if not token_out:
@@ -326,6 +461,28 @@ def decode_swap_intent(w3: Web3, tx) -> Optional[SwapIntent]:
                     amount_in_wei=int(tx.value),
                     kind="universal"
                 )
+            else:
+                # Token->token or token->ETH swap
+                if len(likely_tokens) >= 2:
+                    # For non-ETH swaps, try to identify input/output tokens
+                    token_in = likely_tokens[0]
+                    token_out = likely_tokens[1]
+                    
+                    # If one of them is WETH, it's likely the output for a token->ETH swap
+                    if WETH9 in likely_tokens:
+                        weth_index = likely_tokens.index(WETH9)
+                        non_weth_tokens = [t for t in likely_tokens if t != WETH9]
+                        if non_weth_tokens:
+                            token_in = non_weth_tokens[0]
+                            token_out = WETH9
+                    
+                    return SwapIntent(
+                        token_in=token_in,
+                        token_out=token_out,
+                        amount_in_wei=None,  # Can't easily determine from multicall
+                        kind="universal"
+                    )
+                    
         except Exception:
             pass
 
@@ -416,6 +573,76 @@ def _try_v3_twohop_roundtrip(w3: Web3, quoter, eth_in: int, token: str) -> Optio
             except Exception:
                 continue
     return best
+
+# --------- Token validation helpers ----------
+def validate_token_liquidity(w3: Web3, token: str, min_liquidity_wei: int = None) -> bool:
+    """
+    Validate if a token has sufficient liquidity for sandwich attacks.
+    Returns True if token passes validation, False otherwise.
+    """
+    if min_liquidity_wei is None:
+        min_liquidity_wei = Web3.to_wei(5, "ether")  # Default minimum 5 ETH liquidity
+        
+    try:
+        # Check if token has valid contract code
+        code = w3.eth.get_code(token)
+        if len(code) <= 2:  # No contract code (just "0x")
+            return False
+            
+        # Check V3 pool liquidity for common fee tiers
+        quoter = w3.eth.contract(address=UNISWAP_V3_QUOTERV2, abi=QUOTER_V2_ABI)
+        
+        test_amount = Web3.to_wei(0.1, "ether")  # Test with 0.1 ETH
+        max_liquidity = 0
+        
+        for fee in [500, 3000, 10000]:
+            try:
+                # Try to get quote for WETH -> token
+                result = quoter.functions.quoteExactInputSingle(
+                    WETH9, token, fee, test_amount, 0
+                ).call()
+                if result[0] > 0:  # If we get a valid quote
+                    # Try reverse quote to check both directions
+                    reverse_result = quoter.functions.quoteExactInputSingle(
+                        token, WETH9, fee, result[0], 0
+                    ).call()
+                    if reverse_result[0] > 0:
+                        max_liquidity = max(max_liquidity, reverse_result[0])
+            except Exception:
+                continue
+                
+        # Also check V2 liquidity
+        try:
+            router = w3.eth.contract(address=UNISWAP_V2_ROUTER, abi=UNISWAP_V2_ROUTER_ABI)
+            amounts = router.functions.getAmountsOut(test_amount, [WETH9, token]).call()
+            if len(amounts) >= 2 and amounts[-1] > 0:
+                # Try reverse to check liquidity depth
+                reverse_amounts = router.functions.getAmountsOut(amounts[-1], [token, WETH9]).call()
+                if len(reverse_amounts) >= 2 and reverse_amounts[-1] > 0:
+                    max_liquidity = max(max_liquidity, reverse_amounts[-1])
+        except Exception:
+            pass
+            
+        # Token passes if it has sufficient liquidity in at least one pool
+        return max_liquidity >= min_liquidity_wei
+        
+    except Exception:
+        return False
+
+def is_token_blacklisted(token: str) -> bool:
+    """
+    Check if token is in blacklist of known problematic tokens.
+    Add tokens here that are known to cause issues (rebasing, fee-on-transfer, etc.)
+    """
+    token = token.lower()
+    
+    # Known problematic tokens (add addresses as needed)
+    blacklisted_tokens = {
+        # Add problematic token addresses here
+        # Example: "0x..." for tokens with transfer fees, rebasing mechanics, etc.
+    }
+    
+    return token in blacklisted_tokens
 
 # --------- Gas helpers ----------
 def _get_base_and_fees(w3: Web3, priority_gwei: int) -> Tuple[int, int]:
