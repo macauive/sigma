@@ -29,18 +29,41 @@ from utils import (
 # ------------ Setup ------------
 load_dotenv("private.env")
 
-# Use a WebSocket endpoint only (Alchemy/Infura/QuickNode etc.)
-ETH_WS_URL = (os.getenv("ETH_WS_URL") or os.getenv("ETH_NODE_URL") or "").strip()
+# Use WebSocket endpoints with multiple fallbacks (Alchemy/Infura/QuickNode etc.)
+ETH_WS_URL = os.getenv("ETH_WS_URL").strip()
+ETH_WS_URL_FALLBACK = os.getenv("ETH_WS_URL_FALLBACK", "").strip()
+ETH_WS_URL_FALLBACK2 = os.getenv("ETH_WS_URL_FALLBACK2", "").strip()
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 FLASHBOTS_KEY = os.getenv("FLASHBOTS_KEY")
 
+# Build list of available WebSocket URLs
+WS_URLS = [url for url in [ETH_WS_URL, ETH_WS_URL_FALLBACK, ETH_WS_URL_FALLBACK2] if url and url.startswith(("ws://", "wss://"))]
+
 if not PRIVATE_KEY or not FLASHBOTS_KEY:
     raise RuntimeError("Missing PRIVATE_KEY or FLASHBOTS_KEY in environment.")
-if not ETH_WS_URL.startswith(("ws://", "wss://")):
-    raise RuntimeError("Set ETH_WS_URL or ETH_NODE_URL to a wss:// (or ws://) endpoint.")
+if not WS_URLS:
+    raise RuntimeError("Set at least one valid WebSocket URL (ETH_WS_URL, ETH_WS_URL_FALLBACK, ETH_WS_URL_FALLBACK2).")
 
-# Web3 over WebSocket only
-w3 = Web3(WebsocketProvider(ETH_WS_URL, websocket_timeout=60))
+# Web3 over WebSocket with fallback capability
+current_ws_index = 0
+current_ws_url = WS_URLS[current_ws_index]
+
+# Try to connect to providers at startup, fallback if needed
+for i, ws_url in enumerate(WS_URLS):
+    try:
+        print(f"[boot] Trying provider {i+1}: {ws_url}")
+        w3 = Web3(WebsocketProvider(ws_url, websocket_timeout=10))
+        # Test connection with a simple call
+        block_num = w3.eth.block_number
+        current_ws_index = i
+        current_ws_url = ws_url
+        print(f"[boot] Connected successfully to provider {i+1}, latest block: {block_num}")
+        break
+    except Exception as e:
+        print(f"[boot] Provider {i+1} failed: {e}")
+        if i == len(WS_URLS) - 1:
+            raise RuntimeError("All WebSocket providers failed to connect")
+        continue
 
 searcher = Account.from_key(PRIVATE_KEY)
 fb_signer = Account.from_key(FLASHBOTS_KEY)
@@ -80,19 +103,45 @@ def start_ws_thread():
         print(f"[ws close] code={code} msg={msg}")
 
     def run():
+        global current_ws_index, current_ws_url, w3
+        
         while True:
             try:
+                ws_url = WS_URLS[current_ws_index]
+                provider_name = ["Primary", "Fallback", "Fallback2"][current_ws_index] if current_ws_index < 3 else f"Provider{current_ws_index+1}"
+                print(f"[ws] Connecting to {provider_name} WebSocket...")
+                
                 ws = websocket.WebSocketApp(
-                    ETH_WS_URL,
+                    ws_url,
                     on_open=on_open,
                     on_message=on_message,
                     on_error=on_error,
                     on_close=on_close,
                 )
                 ws.run_forever(ping_interval=20, ping_timeout=10)
+                current_ws_index = 0  # Reset to primary on successful connection
             except Exception as e:
+                error_str = str(e).lower()
                 print(f"[ws fatal] {e}")
-            time.sleep(3)
+                
+                # Check for rate limiting or quota exceeded
+                if any(phrase in error_str for phrase in ["429", "too many requests", "quota", "limit exceeded", "credits"]):
+                    if current_ws_index < len(WS_URLS) - 1:
+                        current_ws_index += 1
+                        current_ws_url = WS_URLS[current_ws_index]
+                        print(f"[ws] Switching to next provider due to rate limiting: {current_ws_url}")
+                        # Update main Web3 instance
+                        try:
+                            w3.provider = WebsocketProvider(current_ws_url, websocket_timeout=60)
+                            print(f"[ws] Updated main Web3 provider")
+                        except Exception as provider_error:
+                            print(f"[ws] Failed to update Web3 provider: {provider_error}")
+                        continue
+                    else:
+                        print(f"[ws] All providers rate limited, cycling back to primary...")
+                        current_ws_index = 0  # Reset to primary immediately
+                else:
+                    time.sleep(1)  # Minimal delay for non-rate-limit errors
 
     Thread(target=run, daemon=True).start()
 
