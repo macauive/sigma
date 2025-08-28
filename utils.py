@@ -185,6 +185,87 @@ ONEINCH_AGG_ABI = [{
     "outputs":[{"name":"returnAmount","type":"uint256"}]
 }]
 
+# Curve Pool ABI (simplified for common functions)
+CURVE_POOL_ABI = [
+    {"type":"function","name":"exchange","stateMutability":"payable",
+     "inputs":[
+        {"name":"i","type":"int128"},
+        {"name":"j","type":"int128"},
+        {"name":"dx","type":"uint256"},
+        {"name":"min_dy","type":"uint256"}],
+     "outputs":[{"name":"","type":"uint256"}]},
+    {"type":"function","name":"exchange_underlying","stateMutability":"payable",
+     "inputs":[
+        {"name":"i","type":"int128"},
+        {"name":"j","type":"int128"},
+        {"name":"dx","type":"uint256"},
+        {"name":"min_dy","type":"uint256"}],
+     "outputs":[{"name":"","type":"uint256"}]},
+    {"type":"function","name":"get_dy","stateMutability":"view",
+     "inputs":[
+        {"name":"i","type":"int128"},
+        {"name":"j","type":"int128"},
+        {"name":"dx","type":"uint256"}],
+     "outputs":[{"name":"","type":"uint256"}]},
+    {"type":"function","name":"get_dy_underlying","stateMutability":"view",
+     "inputs":[
+        {"name":"i","type":"int128"},
+        {"name":"j","type":"int128"},
+        {"name":"dx","type":"uint256"}],
+     "outputs":[{"name":"","type":"uint256"}]},
+    {"type":"function","name":"coins","stateMutability":"view",
+     "inputs":[{"name":"arg0","type":"uint256"}],
+     "outputs":[{"name":"","type":"address"}]},
+    {"type":"function","name":"underlying_coins","stateMutability":"view",
+     "inputs":[{"name":"arg0","type":"uint256"}],
+     "outputs":[{"name":"","type":"address"}]},
+]
+
+# Curve Router ABI
+CURVE_ROUTER_ABI = [
+    {"type":"function","name":"exchange","stateMutability":"payable",
+     "inputs":[
+        {"name":"_route","type":"address[9]"},
+        {"name":"_swap_params","type":"uint256[3][4]"},
+        {"name":"_amount","type":"uint256"},
+        {"name":"_expected","type":"uint256"}],
+     "outputs":[{"name":"","type":"uint256"}]},
+    {"type":"function","name":"get_exchange_amount","stateMutability":"view",
+     "inputs":[
+        {"name":"_pool","type":"address"},
+        {"name":"_from","type":"address"},
+        {"name":"_to","type":"address"},
+        {"name":"_amount","type":"uint256"}],
+     "outputs":[{"name":"","type":"uint256"}]},
+]
+
+# 0x v4 Exchange ABI (updated)
+ZEROX_V4_ABI = [
+    {"type":"function","name":"transformERC20","stateMutability":"payable",
+     "inputs":[
+        {"name":"inputToken","type":"address"},
+        {"name":"outputToken","type":"address"},
+        {"name":"inputTokenAmount","type":"uint256"},
+        {"name":"minOutputTokenAmount","type":"uint256"},
+        {"name":"transformations","type":"tuple[]","components":[
+            {"name":"deploymentNonce","type":"uint32"},
+            {"name":"data","type":"bytes"}]}],
+     "outputs":[{"name":"outputTokenAmount","type":"uint256"}]},
+    {"type":"function","name":"sellToUniswap","stateMutability":"payable",
+     "inputs":[
+        {"name":"tokens","type":"address[]"},
+        {"name":"sellAmount","type":"uint256"},
+        {"name":"minBuyAmount","type":"uint256"},
+        {"name":"isSushi","type":"bool"}],
+     "outputs":[{"name":"buyAmount","type":"uint256"}]},
+    {"type":"function","name":"sellToPancakeSwap","stateMutability":"payable",
+     "inputs":[
+        {"name":"tokens","type":"address[]"},
+        {"name":"sellAmount","type":"uint256"},
+        {"name":"minBuyAmount","type":"uint256"}],
+     "outputs":[{"name":"buyAmount","type":"uint256"}]},
+]
+
 # --------- Logging helpers ---------
 def short_addr(addr: Optional[str]) -> str:
     if not addr:
@@ -332,6 +413,11 @@ def decode_swap_intent(w3: Web3, tx) -> Optional[SwapIntent]:
             return SwapIntent(token_in=src, token_out=dst, amount_in_wei=amt, kind="1inch")
         except Exception:
             pass
+
+    # 0x v4 protocol detection
+    zerox_intent = detect_0x_v4_swap(w3, tx)
+    if zerox_intent:
+        return zerox_intent
 
     # Universal Router: try to decode commands (signature 0x3593564c)
     if to == UNIVERSAL_ROUTER and s4 == "0x3593564c":
@@ -626,6 +712,152 @@ def _try_v3_twohop_roundtrip(w3: Web3, quoter, eth_in: int, token: str) -> Optio
                 continue
     return best
 
+# --------- Curve stablecoin arbitrage helpers ----------
+def get_curve_stablecoin_pools() -> Dict[str, Dict]:
+    """
+    Map of major Curve stablecoin pools with their addresses and token indices.
+    Returns dict mapping pool names to pool info.
+    """
+    return {
+        "3pool": {
+            "address": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",
+            "tokens": {
+                DAI: 0,
+                USDC: 1, 
+                USDT: 2
+            }
+        },
+        "tricrypto2": {
+            "address": CURVE_TRICRYPTO,
+            "tokens": {
+                USDT: 0,
+                WETH9: 2  # Note: WBTC is index 1, we focus on ETH-relevant pairs
+            }
+        }
+    }
+
+def _try_curve_stablecoin_arbitrage(w3: Web3, eth_in: int, token: str) -> Optional[int]:
+    """
+    Try Curve stablecoin arbitrage routes for better pricing on stable swaps.
+    Particularly effective for USDC, USDT, DAI swaps.
+    """
+    if token not in {USDC, USDT, DAI}:
+        return None
+        
+    try:
+        pools = get_curve_stablecoin_pools()
+        best_back = 0
+        
+        # Try 3pool for stablecoin swaps via USDC
+        if "3pool" in pools and token in pools["3pool"]["tokens"]:
+            pool_info = pools["3pool"]
+            pool = w3.eth.contract(address=pool_info["address"], abi=CURVE_POOL_ABI)
+            
+            try:
+                # ETH -> WETH -> USDC via Uniswap, then USDC -> target token via Curve
+                quoter = w3.eth.contract(address=UNISWAP_V3_QUOTERV2, abi=QUOTER_V2_ABI)
+                
+                # Step 1: ETH -> USDC via Uniswap V3
+                usdc_out = int(quoter.functions.quoteExactInputSingle(WETH9, USDC, 500, eth_in, 0).call()[0])
+                
+                if token == USDC:
+                    # Direct USDC, just return the amount
+                    token_out = usdc_out
+                else:
+                    # Step 2: USDC -> target token via Curve
+                    usdc_idx = pool_info["tokens"][USDC]  # 1
+                    token_idx = pool_info["tokens"][token]  # 0 for DAI, 2 for USDT
+                    
+                    token_out = int(pool.functions.get_dy(usdc_idx, token_idx, usdc_out).call())
+                
+                if token_out > 0:
+                    # Step 3: target token -> USDC -> ETH (reverse path)
+                    if token == USDC:
+                        usdc_back = token_out
+                    else:
+                        usdc_back = int(pool.functions.get_dy(pool_info["tokens"][token], pool_info["tokens"][USDC], token_out).call())
+                    
+                    # Step 4: USDC -> ETH via Uniswap
+                    eth_back = int(quoter.functions.quoteExactInputSingle(USDC, WETH9, 500, usdc_back, 0).call()[0])
+                    
+                    best_back = max(best_back, eth_back)
+                    
+            except Exception:
+                pass
+                
+        # Try TriCrypto2 for ETH-based swaps
+        if "tricrypto2" in pools and token == USDT:
+            pool_info = pools["tricrypto2"]
+            pool = w3.eth.contract(address=pool_info["address"], abi=CURVE_POOL_ABI)
+            
+            try:
+                # Direct ETH -> USDT and back via TriCrypto2
+                eth_idx = pool_info["tokens"][WETH9]  # 2
+                usdt_idx = pool_info["tokens"][USDT]  # 0
+                
+                # Step 1: ETH -> USDT via Curve
+                usdt_out = int(pool.functions.get_dy(eth_idx, usdt_idx, eth_in).call())
+                
+                # Step 2: USDT -> ETH via Curve
+                if usdt_out > 0:
+                    eth_back = int(pool.functions.get_dy(usdt_idx, eth_idx, usdt_out).call())
+                    best_back = max(best_back, eth_back)
+                    
+            except Exception:
+                pass
+        
+        return best_back if best_back > 0 else None
+        
+    except Exception:
+        return None
+
+def detect_0x_v4_swap(w3: Web3, tx) -> Optional[SwapIntent]:
+    """
+    Detect 0x v4 protocol swaps with enhanced function signatures.
+    """
+    to = Web3.to_checksum_address(tx.to)
+    data_hex = _hex_input(tx)
+    s4 = "0x" + data_hex[:8]
+    
+    if to in ZEROX_ROUTERS:
+        try:
+            # transformERC20 signature: 0x415565b0
+            if s4 == "0x415565b0":
+                contract = w3.eth.contract(address=to, abi=ZEROX_V4_ABI)
+                fn, args = contract.decode_function_input(tx.input)
+                
+                input_token = Web3.to_checksum_address(args.get("inputToken"))
+                output_token = Web3.to_checksum_address(args.get("outputToken"))
+                input_amount = int(args.get("inputTokenAmount", tx.value or 0))
+                
+                return SwapIntent(
+                    token_in=input_token,
+                    token_out=output_token,
+                    amount_in_wei=input_amount,
+                    kind="0x_v4"
+                )
+            
+            # sellToUniswap signature: 0xd9627aa4
+            elif s4 == "0xd9627aa4":
+                contract = w3.eth.contract(address=to, abi=ZEROX_V4_ABI)
+                fn, args = contract.decode_function_input(tx.input)
+                
+                tokens = args.get("tokens", [])
+                sell_amount = int(args.get("sellAmount", tx.value or 0))
+                
+                if len(tokens) >= 2:
+                    return SwapIntent(
+                        token_in=Web3.to_checksum_address(tokens[0]),
+                        token_out=Web3.to_checksum_address(tokens[-1]),
+                        amount_in_wei=sell_amount,
+                        kind="0x_v4"
+                    )
+            
+        except Exception:
+            pass
+    
+    return None
+
 # --------- Token validation helpers ----------
 def validate_token_liquidity(w3: Web3, token: str, min_liquidity_wei: int = None) -> bool:
     """
@@ -910,6 +1142,11 @@ def estimate_ev_wei(
         if v3: best_back = max(best_back, v3)
         v2 = _try_v2_roundtrip(w3, UNISWAP_V2_ROUTER, my_in, token)
         if v2: best_back = max(best_back, v2)
+        
+        # Try Curve stablecoin arbitrage for better stable token pricing
+        curve_back = _try_curve_stablecoin_arbitrage(w3, my_in, token)
+        if curve_back: best_back = max(best_back, curve_back)
+        
         if best_back <= 0:
             return None
 
@@ -970,6 +1207,11 @@ def estimate_ev_universal_wei(
             b2 = _try_v2_roundtrip_twohop(w3, v2r, my_eth_in, token)
             if b2: 
                 best_back = max(best_back, b2)
+                
+        # Try Curve stablecoin arbitrage for better stable token pricing
+        curve_back = _try_curve_stablecoin_arbitrage(w3, my_eth_in, token)
+        if curve_back:
+            best_back = max(best_back, curve_back)
 
         if best_back <= 0:
             return None
@@ -1067,6 +1309,11 @@ def estimate_ev_dynamic_wei(
                 b2 = _try_v2_roundtrip_twohop(w3, v2r, my_eth_in, token)
                 if b2:
                     best_back = max(best_back, b2)
+                    
+        # Try Curve stablecoin arbitrage for superior stable token pricing
+        curve_back = _try_curve_stablecoin_arbitrage(w3, my_eth_in, token)
+        if curve_back:
+            best_back = max(best_back, curve_back)
 
         if best_back <= 0:
             return None
