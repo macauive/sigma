@@ -4,6 +4,12 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
+web3 = "*"
+python-dotenv = "*"
+requests = "*"
+aiohttp = "*"
+websocket-client = "*"
+web3-flashbots = "*"
 
 [dev-packages]
 

@@ -14,6 +14,11 @@ try:
 except ImportError:
     from flashbots import flashbot        # pip install flashbots
 
+import requests
+import asyncio
+import aiohttp
+from concurrent.futures import ThreadPoolExecutor
+
 from utils import (
     is_uniswap_swap,
     estimate_ev_wei,
@@ -70,7 +75,39 @@ fb_signer = Account.from_key(FLASHBOTS_KEY)
 flashbot(w3, fb_signer)
 
 print(f"[boot] chain={w3.eth.chain_id} searcher={searcher.address}")
-print(f"[rpc] ws  ={ETH_WS_URL}")
+print(f"[rpc] ws  ={current_ws_url}")
+
+# ------------ Multi-Builder Configuration ------------
+class MEVBuilder:
+    def __init__(self, name: str, endpoint: str, requires_auth: bool = False, auth_header: str = None):
+        self.name = name
+        self.endpoint = endpoint
+        self.requires_auth = requires_auth
+        self.auth_header = auth_header
+        self.success_count = 0
+        self.total_submissions = 0
+        self.last_success_time = 0
+        
+    def get_success_rate(self) -> float:
+        return self.success_count / max(1, self.total_submissions)
+        
+    def record_submission(self, success: bool):
+        self.total_submissions += 1
+        if success:
+            self.success_count += 1
+            self.last_success_time = time.time()
+
+# MEV Builder endpoints
+BUILDERS = {
+    "flashbots": MEVBuilder("Flashbots", "https://relay.flashbots.net", True),
+    "beaver": MEVBuilder("Beaver Build", "https://buildai.net", True),  
+    "titan": MEVBuilder("Titan Builder", "https://rpc.titanbuilder.xyz", True),
+    "bloxroute": MEVBuilder("bloXroute", "https://mev.api.blxrbdn.com", True),
+    "eden": MEVBuilder("Eden Network", "https://api.edennetwork.io/v1", True),
+}
+
+# Builder success tracking
+builder_stats = {name: {"sent": 0, "included": 0} for name in BUILDERS.keys()}
 
 # ------------ Pending tx subscription via WebSocket ------------
 pending_tx_queue: "queue.Queue[str]" = queue.Queue()
@@ -147,10 +184,146 @@ def start_ws_thread():
 
 start_ws_thread()
 
+# ------------ Multi-Builder Bundle Submission ------------
+def submit_bundle_to_builder(builder_name: str, bundle: list, target_block: int, priority_fee_gwei: int = 1):
+    """Submit bundle to a specific MEV builder"""
+    try:
+        builder = BUILDERS[builder_name]
+        
+        if builder_name == "flashbots":
+            # Use existing Flashbots integration
+            result = w3.flashbots.send_bundle(bundle, target_block_number=target_block)
+            receipts = result.wait()
+            included = False
+            if isinstance(receipts, list):
+                included = any((r or {}).get("status") == 1 for r in receipts)
+            return included, "flashbots"
+            
+        else:
+            # Generic builder submission via HTTP API
+            bundle_hex = [tx.hex() if isinstance(tx, bytes) else tx for tx in bundle]
+            
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_sendBundle",
+                "params": [{
+                    "txs": bundle_hex,
+                    "blockNumber": hex(target_block),
+                    "minTimestamp": 0,
+                    "maxTimestamp": 0
+                }]
+            }
+            
+            headers = {
+                "Content-Type": "application/json",
+            }
+            
+            # Add auth if required
+            if builder.requires_auth and builder.auth_header:
+                headers["Authorization"] = builder.auth_header
+                
+            response = requests.post(
+                builder.endpoint,
+                json=payload,
+                headers=headers,
+                timeout=5
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return True, builder_name  # Assume success if no error
+            else:
+                print(f"[{builder_name}] HTTP error {response.status_code}: {response.text}")
+                return False, builder_name
+                
+    except Exception as e:
+        print(f"[{builder_name}] Submission error: {e}")
+        return False, builder_name
+
+def submit_bundle_multi_builder(bundle: list, target_block: int, priority_fee_gwei: int = 1):
+    """Submit bundle to multiple builders simultaneously"""
+    
+    # Select builders based on recent performance
+    active_builders = []
+    current_time = time.time()
+    
+    # Always include Flashbots
+    active_builders.append("flashbots")
+    
+    # Include other builders based on recent success
+    for name, builder in BUILDERS.items():
+        if name == "flashbots":
+            continue
+            
+        # Include builder if:
+        # 1. It has good success rate (>10%), OR  
+        # 2. It hasn't been tried much yet (<10 attempts), OR
+        # 3. It had recent success (within last hour)
+        success_rate = builder.get_success_rate()
+        recent_success = (current_time - builder.last_success_time) < 3600  # 1 hour
+        
+        if success_rate > 0.1 or builder.total_submissions < 10 or recent_success:
+            active_builders.append(name)
+    
+    # Limit to top 4 builders to avoid spam
+    active_builders = active_builders[:4]
+    
+    print(f"[multi-builder] Submitting to: {', '.join(active_builders)}")
+    
+    # Submit to all builders concurrently
+    with ThreadPoolExecutor(max_workers=len(active_builders)) as executor:
+        futures = []
+        
+        for builder_name in active_builders:
+            future = executor.submit(
+                submit_bundle_to_builder, 
+                builder_name, 
+                bundle, 
+                target_block, 
+                priority_fee_gwei
+            )
+            futures.append(future)
+        
+        # Collect results
+        results = []
+        any_included = False
+        
+        for future in futures:
+            try:
+                included, builder_name = future.result(timeout=10)
+                results.append((builder_name, included))
+                
+                # Update builder stats
+                BUILDERS[builder_name].record_submission(included)
+                builder_stats[builder_name]["sent"] += 1
+                
+                if included:
+                    builder_stats[builder_name]["included"] += 1
+                    any_included = True
+                    
+            except Exception as e:
+                print(f"[multi-builder] Future error: {e}")
+        
+        return any_included, results
+
+def print_builder_stats():
+    """Print builder performance statistics"""
+    print("\n[builder-stats] Performance Summary:")
+    for name, stats in builder_stats.items():
+        if stats["sent"] > 0:
+            rate = (stats["included"] / stats["sent"]) * 100
+            builder = BUILDERS[name]
+            total_rate = builder.get_success_rate() * 100
+            print(f"  {name}: {stats['included']}/{stats['sent']} ({rate:.1f}%) total_rate={total_rate:.1f}%")
+
 # ------------ Main loop ------------
 def main():
     ev_passed = 0
     ev_missed = 0
+    last_stats_time = time.time()
+    stats_interval = 300  # Print builder stats every 5 minutes
+    
     while True:
         try:
             try:
@@ -227,15 +400,19 @@ def main():
             # Target next block
             target_block = w3.eth.block_number + 1
             try:
-                result = w3.flashbots.send_bundle(bundle, target_block_number=target_block)
-                receipts = result.wait()
-                included = False
-                if isinstance(receipts, list):
-                    included = any((r or {}).get("status") == 1 for r in receipts)
+                # Submit bundle to multiple builders
+                included, results = submit_bundle_multi_builder(bundle, target_block, priority_fee_gwei=1)
+                
                 if included:
                     ev_passed += 1
+                
+                # Show which builders succeeded
+                success_builders = [name for name, success in results if success]
+                all_builders = [name for name, _ in results]
+                
                 print(
                     f"[bundle] sent -> target={target_block} included={included} "
+                    f"builders={'/'.join(all_builders)} success={'/'.join(success_builders) if success_builders else 'none'} "
                     f"ev={Web3.from_wei(ev_wei, 'ether')} "
                     f"gas={Web3.from_wei(gas_wei, 'ether')} "
                     f"in={Web3.from_wei(my_eth_in, 'ether')} "
@@ -247,6 +424,12 @@ def main():
 
             if ev_passed % 10 == 0 and ev_passed > 0:
                 print(f"[stats] EV Passed: {ev_passed} | Missed: {ev_missed}")
+            
+            # Print builder stats periodically
+            current_time = time.time()
+            if current_time - last_stats_time > stats_interval:
+                print_builder_stats()
+                last_stats_time = current_time
 
         except KeyboardInterrupt:
             print("bye")

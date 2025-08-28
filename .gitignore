@@ -52,4 +52,5 @@ Thumbs.db
 # MEV specific
 bundles/
 transactions/
+dev_plan.txt
 *.backup
