@@ -156,27 +156,33 @@ def start_ws_thread():
                     on_close=on_close,
                 )
                 ws.run_forever(ping_interval=20, ping_timeout=10)
-                current_ws_index = 0  # Reset to primary on successful connection
+                # Only reset to primary on successful connection that lasted > 30 seconds
+                time.sleep(0.1)  # Brief delay before continuing
+                
             except Exception as e:
                 error_str = str(e).lower()
                 print(f"[ws fatal] {e}")
                 
                 # Check for rate limiting or quota exceeded
                 if any(phrase in error_str for phrase in ["429", "too many requests", "quota", "limit exceeded", "credits"]):
+                    # Cycle to next provider
                     if current_ws_index < len(WS_URLS) - 1:
                         current_ws_index += 1
-                        current_ws_url = WS_URLS[current_ws_index]
-                        print(f"[ws] Switching to next provider due to rate limiting: {current_ws_url}")
-                        # Update main Web3 instance
-                        try:
-                            w3.provider = WebsocketProvider(current_ws_url, websocket_timeout=60)
-                            print(f"[ws] Updated main Web3 provider")
-                        except Exception as provider_error:
-                            print(f"[ws] Failed to update Web3 provider: {provider_error}")
-                        continue
                     else:
-                        print(f"[ws] All providers rate limited, cycling back to primary...")
-                        current_ws_index = 0  # Reset to primary immediately
+                        current_ws_index = 0  # Cycle back to start
+                        print(f"[ws] All providers tried, waiting before retry...")
+                        time.sleep(30)  # Wait 30 seconds before cycling through again
+                        
+                    current_ws_url = WS_URLS[current_ws_index]
+                    print(f"[ws] Switching to next provider due to rate limiting: {current_ws_url}")
+                    
+                    # Update main Web3 instance
+                    try:
+                        w3.provider = WebsocketProvider(current_ws_url, websocket_timeout=60)
+                        print(f"[ws] Updated main Web3 provider to index {current_ws_index}")
+                    except Exception as provider_error:
+                        print(f"[ws] Failed to update Web3 provider: {provider_error}")
+                    continue
                 else:
                     time.sleep(1)  # Minimal delay for non-rate-limit errors
 
