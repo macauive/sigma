@@ -41,6 +41,11 @@ ETH_WS_URL_FALLBACK2 = os.getenv("ETH_WS_URL_FALLBACK2", "").strip()
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 FLASHBOTS_KEY = os.getenv("FLASHBOTS_KEY")
 
+# Optional tuning parameters
+MIN_PROFIT_ETH = float(os.getenv("MIN_PROFIT_ETH", "0.001"))  # Default 0.001 ETH minimum profit
+PRIORITY_FEE_GWEI = int(os.getenv("PRIORITY_FEE_GWEI", "1"))   # Default 1 gwei priority fee
+DRY_RUN = bool(int(os.getenv("DRY_RUN", "0")))                # Default false (actually execute trades)
+
 # Build list of available WebSocket URLs
 WS_URLS = [url for url in [ETH_WS_URL, ETH_WS_URL_FALLBACK, ETH_WS_URL_FALLBACK2] if url and url.startswith(("ws://", "wss://"))]
 
@@ -76,6 +81,7 @@ flashbot(w3, fb_signer)
 
 print(f"[boot] chain={w3.eth.chain_id} searcher={searcher.address}")
 print(f"[rpc] ws  ={current_ws_url}")
+print(f"[config] MIN_PROFIT_ETH={MIN_PROFIT_ETH}, PRIORITY_FEE_GWEI={PRIORITY_FEE_GWEI}, DRY_RUN={DRY_RUN}")
 
 # ------------ Multi-Builder Configuration ------------
 class MEVBuilder:
@@ -134,10 +140,51 @@ def start_ws_thread():
             pass
 
     def on_error(ws, error):
+        global current_ws_index, current_ws_url, w3
         print(f"[ws error] {error}")
+        
+        # Check for rate limiting in WebSocket error
+        error_str = str(error).lower()
+        if any(phrase in error_str for phrase in ["429", "too many requests", "quota", "limit exceeded"]):
+            print(f"[ws] Rate limit detected in error, switching providers...")
+            if current_ws_index < len(WS_URLS) - 1:
+                current_ws_index += 1
+            else:
+                current_ws_index = 0
+                print(f"[ws] All providers exhausted, cycling back with delay...")
+            
+            current_ws_url = WS_URLS[current_ws_index]
+            print(f"[ws] Switching to provider {current_ws_index + 1}: {current_ws_url}")
+            
+            # Update main Web3 instance
+            try:
+                w3.provider = WebsocketProvider(current_ws_url, websocket_timeout=60)
+                print(f"[ws] Updated Web3 provider to {current_ws_url}")
+            except Exception as e:
+                print(f"[ws] Failed to update Web3 provider: {e}")
 
     def on_close(ws, code, msg):
+        global current_ws_index, current_ws_url, w3
         print(f"[ws close] code={code} msg={msg}")
+        
+        # Check for rate limiting in close message
+        if code == 1008 or (msg and "too many requests" in str(msg).lower()):
+            print(f"[ws] Rate limit detected in close, switching providers...")
+            if current_ws_index < len(WS_URLS) - 1:
+                current_ws_index += 1
+            else:
+                current_ws_index = 0
+                print(f"[ws] All providers exhausted, will retry after delay...")
+            
+            current_ws_url = WS_URLS[current_ws_index] 
+            print(f"[ws] Switching to provider {current_ws_index + 1}: {current_ws_url}")
+            
+            # Update main Web3 instance
+            try:
+                w3.provider = WebsocketProvider(current_ws_url, websocket_timeout=60)
+                print(f"[ws] Updated Web3 provider to {current_ws_url}")
+            except Exception as e:
+                print(f"[ws] Failed to update Web3 provider: {e}")
 
     def run():
         global current_ws_index, current_ws_url, w3
@@ -352,25 +399,47 @@ def main():
             intent = decode_swap_intent(w3, tx)
             if not intent or not intent.token_out:
                 ev_missed += 1
+                print(f"[debug] Failed intent decode: intent={intent is not None}, token_out={getattr(intent, 'token_out', None) if intent else None}")
+                continue
+
+            print(f"[debug] Processing swap: {intent.token_in} -> {intent.token_out}, amount={intent.amount_in_wei}, kind={intent.kind}")
+
+            # Early validation: check if token addresses look valid
+            if intent.token_out and not validate_token_liquidity(w3, intent.token_out):
+                ev_missed += 1
+                print(f"[debug] Token validation failed for {intent.token_out}")
                 continue
 
             # Try dynamic sizing first (most advanced), then fallback to other methods
-            res = estimate_ev_dynamic_wei(w3, tx, priority_fee_gwei=1)
+            res = estimate_ev_dynamic_wei(w3, tx, priority_fee_gwei=PRIORITY_FEE_GWEI)
+            estimator_used = "dynamic"
             if res is None:
                 # Fallback to strict estimator
-                res = estimate_ev_wei(w3, tx, priority_fee_gwei=1)
+                res = estimate_ev_wei(w3, tx, priority_fee_gwei=PRIORITY_FEE_GWEI)
+                estimator_used = "strict"
             if res is None:
-                # Final fallback to universal estimator
-                res = estimate_ev_universal_wei(w3, tx, buy_portion_bps=300, priority_fee_gwei=1)
+                # Final fallback to universal estimator with more generous parameters
+                res = estimate_ev_universal_wei(w3, tx, buy_portion_bps=500, priority_fee_gwei=PRIORITY_FEE_GWEI)  # Increased from 300 to 500 bps
+                estimator_used = "universal"
 
             if res is None:
                 ev_missed += 1
+                print(f"[debug] All EV estimators failed for {intent.token_out}")
                 if ev_missed % 50 == 0:
                     print(f"[stats] EV Passed: {ev_passed} | Missed: {ev_missed}")
                 continue
 
             ev_wei, gas_wei, my_eth_in, back = res
+            profit_eth = Web3.from_wei(back - my_eth_in, 'ether')
+            print(f"[debug] EV result from {estimator_used}: ev={Web3.from_wei(ev_wei, 'ether'):.6f} ETH, profit={profit_eth:.6f} ETH")
+            
             if ev_wei <= 0:
+                print(f"[debug] Negative EV: {Web3.from_wei(ev_wei, 'ether'):.6f} ETH")
+                continue
+                
+            # Apply MIN_PROFIT_ETH threshold
+            if profit_eth < MIN_PROFIT_ETH:
+                print(f"[debug] Profit {profit_eth:.6f} ETH below minimum threshold {MIN_PROFIT_ETH} ETH")
                 continue
 
             # Decode victim for token_out
@@ -398,7 +467,7 @@ def main():
                 continue
 
             bundle = build_sandwich_bundle(
-                w3, searcher, victim_raw, tx, token_out, my_eth_in, fee=3000, priority_fee_gwei=1
+                w3, searcher, victim_raw, tx, token_out, my_eth_in, fee=3000, priority_fee_gwei=PRIORITY_FEE_GWEI
             )
             if not bundle:
                 continue
@@ -407,7 +476,7 @@ def main():
             target_block = w3.eth.block_number + 1
             try:
                 # Submit bundle to multiple builders
-                included, results = submit_bundle_multi_builder(bundle, target_block, priority_fee_gwei=1)
+                included, results = submit_bundle_multi_builder(bundle, target_block, priority_fee_gwei=PRIORITY_FEE_GWEI)
                 
                 if included:
                     ev_passed += 1

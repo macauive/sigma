@@ -335,7 +335,19 @@ def _scan_addresses_from_calldata(data_hex_no0x: str) -> List[str]:
             ca = Web3.to_checksum_address(addr)
         except Exception:
             continue
+        # Skip addresses that are all zeros or have too many leading zeros
         if ca.endswith("0000000000000000000000000000000000000000"):
+            continue
+        # Skip addresses with excessive leading zeros (likely padding, not real addresses)
+        # Real addresses can have some leading zeros but not 12+ bytes
+        addr_bytes = b[i:i+20]
+        leading_zero_count = 0
+        for byte in addr_bytes:
+            if byte == 0:
+                leading_zero_count += 1
+            else:
+                break
+        if leading_zero_count > 11:  # More than 11 leading zero bytes is suspicious
             continue
         if ca not in seen:
             seen.add(ca); out.append(ca)
@@ -401,18 +413,56 @@ def decode_swap_intent(w3: Web3, tx) -> Optional[SwapIntent]:
         except Exception:
             pass
 
-    # 1inch
-    if to in ONEINCH_ROUTERS and s4 == "0x12aa3caf":
-        c = w3.eth.contract(address=to, abi=ONEINCH_AGG_ABI)
-        try:
-            fn, args = c.decode_function_input(tx.input)
-            desc = args.get("desc") or {}
-            src = Web3.to_checksum_address(desc.get("srcToken"))
-            dst = Web3.to_checksum_address(desc.get("dstToken"))
-            amt = int(desc.get("amount") or tx.value or 0)
-            return SwapIntent(token_in=src, token_out=dst, amount_in_wei=amt, kind="1inch")
-        except Exception:
-            pass
+    # 1inch - handle multiple function signatures
+    if to in ONEINCH_ROUTERS:
+        # 0x12aa3caf = swap function
+        # 0x07ed2379 = unoswap function
+        # 0xe449022e = uniswapV3Swap function
+        if s4 in ("0x12aa3caf", "0x07ed2379", "0xe449022e", "0x0502b1c5"):
+            # For known 1inch swap functions, scan for token addresses in calldata
+            # instead of trying to decode (1inch uses complex encoding)
+            try:
+                addrs = _scan_addresses_from_calldata(data_hex)
+                # Filter to valid token addresses
+                valid_tokens = []
+                for addr in addrs:
+                    if is_valid_token_address(addr) and addr not in ONEINCH_ROUTERS:
+                        valid_tokens.append(addr)
+
+                # Determine tokens based on ETH value
+                if int(tx.value or 0) > 0:
+                    # ETH -> token swap
+                    token_in = WETH9
+                    token_out = None
+                    # Find first valid non-WETH token
+                    for addr in valid_tokens:
+                        if addr != WETH9:
+                            token_out = addr
+                            break
+
+                    if token_out:
+                        return SwapIntent(
+                            token_in=token_in,
+                            token_out=token_out,
+                            amount_in_wei=int(tx.value),
+                            kind="1inch"
+                        )
+                else:
+                    # Token -> token or token -> ETH swap
+                    if len(valid_tokens) >= 2:
+                        # Take first two valid tokens
+                        token_in = valid_tokens[0]
+                        token_out = valid_tokens[1] if valid_tokens[1] != token_in else (valid_tokens[2] if len(valid_tokens) > 2 else None)
+
+                        if token_out:
+                            return SwapIntent(
+                                token_in=token_in,
+                                token_out=token_out,
+                                amount_in_wei=None,
+                                kind="1inch"
+                            )
+            except Exception:
+                pass
 
     # 0x v4 protocol detection
     zerox_intent = detect_0x_v4_swap(w3, tx)
@@ -865,7 +915,27 @@ def validate_token_liquidity(w3: Web3, token: str, min_liquidity_wei: int = None
     Returns True if token passes validation, False otherwise.
     """
     if min_liquidity_wei is None:
-        min_liquidity_wei = Web3.to_wei(5, "ether")  # Default minimum 5 ETH liquidity
+        min_liquidity_wei = Web3.to_wei(0.1, "ether")  # Reduced from 1 ETH to 0.1 ETH for more opportunities
+    
+    # First check if this looks like a real token address
+    if not is_valid_token_address(token):
+        return False
+    
+    # Whitelist of known good tokens that should always pass
+    known_good_tokens = {
+        WETH9.lower(),   # WETH
+        USDC.lower(),    # USDC  
+        USDT.lower(),    # USDT
+        DAI.lower(),     # DAI
+        "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",  # WBTC
+        "0x514910771af9ca656af840dff83e8264ecf986ca",  # LINK
+        "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",  # UNI
+        "0x7d1afa7b718fb893db30a3abc0cfc608aacfebb0",  # MATIC
+        "0xa0b73e1ff0b80914ab6fe0444e65848c4c34450b",  # CRO
+    }
+    
+    if token.lower() in known_good_tokens:
+        return True
         
     try:
         # Check if token has valid contract code
@@ -909,6 +979,75 @@ def validate_token_liquidity(w3: Web3, token: str, min_liquidity_wei: int = None
             
         # Token passes if it has sufficient liquidity in at least one pool
         return max_liquidity >= min_liquidity_wei
+        
+    except Exception:
+        return False
+
+def is_valid_token_address(token: str) -> bool:
+    """
+    Check if a token address looks legitimate and not like function signature data.
+    """
+    try:
+        token = token.lower()
+        
+        # Basic format check
+        if not token.startswith("0x") or len(token) != 42:
+            return False
+        
+        # Check for common function signature patterns that get misidentified as tokens
+        function_signatures = {
+            "0x12aa3caf",  # 1inch swap function
+            "0x07ed2379",  # 1inch unoswap function
+            "0x38ed1739",  # swapExactTokensForTokens
+            "0x5ae401dc",  # multicall
+            "0x414bf389",  # exactInputSingle
+            "0x83800a8e",  # Another 0x function
+            "0xe449022e",  # 1inch uniswapV3Swap
+            "0x04e45aaf",  # V3 Router function
+            "0xbaa2abde",  # V2 Router function
+            "0x791ac947",  # V2 Router swapTokensForExactTokens
+            "0x7ff36ab5",  # V2 Router swapExactETHForTokens
+            "0xb6f9de95",  # V2 Router swapExactETHForTokensSupportingFeeOnTransfer
+            "0x5c11d795",  # V2 Router swapExactTokensForETHSupportingFeeOnTransfer
+            "0x4a25d94a",  # V2 Router swapTokensForExactETH
+            "0x8803dbee",  # V2 Router swapTokensForExactTokens variant
+            "0xa6886da9",  # ParaSwap function
+            "0x0502b1c5",  # 1inch function
+        }
+
+        # Check if it starts with known function signatures
+        # Check both the full address and partial matches
+        for sig in function_signatures:
+            if token.startswith(sig):
+                return False
+            # Also check if function signature appears in middle/end (common in calldata scanning)
+            sig_bytes = sig[2:].lower()  # Remove 0x prefix
+            if sig_bytes in token[2:]:  # Check in address body
+                return False
+        
+        # Check for patterns that indicate malformed addresses
+        # - Too many repeated patterns
+        # - Addresses that end with function signature patterns
+        if token.count("000000000000000000000000") > 0:
+            return False
+            
+        # Check for addresses that look like they contain function signatures
+        for sig in function_signatures:
+            if sig[2:] in token:  # Remove 0x and check if sig is in address
+                return False
+        
+        # Check for other suspicious patterns
+        suspicious_patterns = [
+            "aa3caf",    # Part of 1inch function sig
+            "ed2379",    # Part of another function sig
+            "5141b82f",  # Common pattern in fake addresses
+        ]
+        
+        for pattern in suspicious_patterns:
+            if pattern in token:
+                return False
+        
+        return True
         
     except Exception:
         return False
@@ -1155,7 +1294,8 @@ def estimate_ev_wei(
         gas_wei = gas_bundle * max_fee
         ev_wei = best_back - my_in - gas_wei
         return ev_wei, gas_wei, my_in, best_back
-    except Exception:
+    except Exception as e:
+        print(f"[debug] estimate_ev_wei exception: {type(e).__name__}: {e}")
         return None
 
 # --------- Public: universal EV ----------
@@ -1219,13 +1359,14 @@ def estimate_ev_universal_wei(
         gas_bundle = 65_000 + 70_000 + 250_000 + 70_000 + 250_000
         gas_wei = gas_bundle * max_fee
         ev_wei = best_back - my_eth_in - gas_wei
-        
-        # Don't return negative EV - it causes "value must be between" errors  
+
+        # Don't return negative EV - it causes "value must be between" errors
         if ev_wei <= 0:
             return None
-            
+
         return ev_wei, gas_wei, my_eth_in, best_back
-    except Exception:
+    except Exception as e:
+        print(f"[debug] estimate_ev_universal_wei exception: {type(e).__name__}: {e}")
         return None
 
 # --------- Dynamic EV estimator with optimal sizing ----------
@@ -1322,13 +1463,15 @@ def estimate_ev_dynamic_wei(
         gas_wei = gas_bundle * max_fee
         ev_wei = best_back - my_eth_in - gas_wei
         
-        # Higher profit threshold for dynamic sizing (should be more profitable)
-        min_profit_threshold = Web3.to_wei(0.005, "ether")  # Min 0.005 ETH profit
+        # Apply minimum profit threshold (note: main.py will also check this)
+        # This is just a backup check in case the estimator is called directly
+        min_profit_threshold = Web3.to_wei(0.001, "ether")  # Default fallback threshold
         if ev_wei <= min_profit_threshold:
             return None
-            
+
         return ev_wei, gas_wei, my_eth_in, best_back
-    except Exception:
+    except Exception as e:
+        print(f"[debug] estimate_ev_dynamic_wei exception: {type(e).__name__}: {e}")
         return None
 
 # --------- Sandwich bundle builder (simple V3 single-hop) ----------
