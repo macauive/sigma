@@ -42,7 +42,7 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 FLASHBOTS_KEY = os.getenv("FLASHBOTS_KEY")
 
 # Optional tuning parameters
-MIN_PROFIT_ETH = float(os.getenv("MIN_PROFIT_ETH", "0.001"))  # Default 0.001 ETH minimum profit
+MIN_PROFIT_ETH = float(os.getenv("MIN_PROFIT_ETH", "0.0005"))  # Lowered from 0.001 to 0.0005 ETH to find more opportunities
 PRIORITY_FEE_GWEI = int(os.getenv("PRIORITY_FEE_GWEI", "1"))   # Default 1 gwei priority fee
 DRY_RUN = bool(int(os.getenv("DRY_RUN", "0")))                # Default false (actually execute trades)
 

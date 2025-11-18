@@ -1,8 +1,127 @@
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Callable, TypeVar, Any
 from eth_account import Account
 from web3 import Web3
+from functools import wraps
+
+# --------- RPC Retry Logic ---------
+T = TypeVar('T')
+
+def retry_rpc_call(max_retries: int = 3, base_delay: float = 0.1) -> Callable:
+    """
+    Decorator to retry RPC calls with exponential backoff.
+    Handles common RPC errors like rate limiting and internal errors.
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> T:
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    error_msg = str(e).lower()
+
+                    # Check if it's a retriable error
+                    retriable_errors = [
+                        "internal error",
+                        "429",
+                        "too many requests",
+                        "rate limit",
+                        "timeout",
+                        "connection",
+                        "quota",
+                    ]
+
+                    is_retriable = any(err in error_msg for err in retriable_errors)
+
+                    if not is_retriable or attempt == max_retries - 1:
+                        # Not retriable or last attempt, raise immediately
+                        raise
+
+                    # Exponential backoff with jitter
+                    delay = base_delay * (2 ** attempt)
+                    time.sleep(delay)
+
+            # Should never reach here, but just in case
+            raise last_exception
+        return wrapper
+    return decorator
+
+def safe_rpc_call(func: Callable[..., T], *args, max_retries: int = 2, **kwargs) -> Optional[T]:
+    """
+    Execute an RPC call with retry logic and error handling.
+    Returns None if all retries fail instead of raising an exception.
+    """
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            error_msg = str(e).lower()
+            retriable_errors = ["internal error", "429", "too many requests", "rate limit", "timeout", "connection", "quota"]
+            is_retriable = any(err in error_msg for err in retriable_errors)
+
+            if not is_retriable or attempt == max_retries - 1:
+                return None  # Give up and return None
+
+            # Exponential backoff
+            delay = 0.05 * (2 ** attempt)
+            time.sleep(delay)
+
+    return None
+
+# --------- Quote Caching ---------
+class QuoteCache:
+    """
+    Simple time-based cache for quote results to reduce RPC calls.
+    Cache entries expire after a short time (default 5 seconds).
+    """
+    def __init__(self, ttl_seconds: float = 5.0):
+        self.cache: Dict[str, Tuple[Any, float]] = {}
+        self.ttl = ttl_seconds
+
+    def get(self, key: str) -> Optional[Any]:
+        """Get cached value if not expired."""
+        if key in self.cache:
+            value, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return value
+            else:
+                # Expired, remove it
+                del self.cache[key]
+        return None
+
+    def set(self, key: str, value: Any):
+        """Cache a value with current timestamp."""
+        self.cache[key] = (value, time.time())
+
+    def clear_expired(self):
+        """Remove expired entries from cache."""
+        current_time = time.time()
+        expired_keys = [k for k, (_, ts) in self.cache.items() if current_time - ts >= self.ttl]
+        for k in expired_keys:
+            del self.cache[k]
+
+# Global quote cache instance
+_quote_cache = QuoteCache(ttl_seconds=5.0)
+
+def cached_quote_call(cache_key: str, func: Callable[..., T], *args, **kwargs) -> Optional[T]:
+    """
+    Execute a quote call with caching. Checks cache first, then calls function if needed.
+    """
+    # Check cache
+    cached_result = _quote_cache.get(cache_key)
+    if cached_result is not None:
+        return cached_result
+
+    # Cache miss, execute the call
+    result = safe_rpc_call(func, *args, **kwargs)
+    if result is not None:
+        _quote_cache.set(cache_key, result)
+
+    return result
 
 # --------- Addresses (Ethereum mainnet) ---------
 UNISWAP_V2_ROUTER   = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
@@ -325,32 +444,97 @@ def _parse_v3_path(path_bytes: bytes) -> Tuple[List[str], List[int]]:
             i += 3
     return tokens, fees
 
-def _scan_addresses_from_calldata(data_hex_no0x: str) -> List[str]:
+def _scan_addresses_from_calldata(data_hex_no0x: str, debug: bool = False) -> List[str]:
+    """
+    Scan calldata for potential token addresses with improved filtering.
+    Uses ABI-aware scanning at proper boundaries to avoid false positives.
+    """
     b = bytes.fromhex(data_hex_no0x)
     seen, out = set(), []
-    # scan on 1-byte steps to be permissive
-    for i in range(0, max(0, len(b) - 20 + 1)):
-        addr = "0x" + b[i:i+20].hex()
+    rejected_count = 0
+
+    # Common function signatures that get misidentified as addresses
+    FUNCTION_SIGS = {
+        b'\x12\xaa\x3c\xaf', b'\x07\xed\x23\x79', b'\x38\xed\x17\x39', b'\x5a\xe4\x01\xdc',
+        b'\x41\x4b\xf3\x89', b'\x83\x80\x0a\x8e', b'\xe4\x49\x02\x2e', b'\x04\xe4\x5a\xaf',
+        b'\xba\xa2\xab\xde', b'\x79\x1a\xc9\x47', b'\x7f\xf3\x6a\xb5', b'\xb6\xf9\xde\x95',
+        b'\x5c\x11\xd7\x95', b'\x4a\x25\xd9\x4a', b'\x88\x03\xdb\xee', b'\xa6\x88\x6d\xa9',
+        b'\x05\x02\xb1\xc5', b'\xc3\xcf\x80\x43', b'\x13\xd7\x9a\x0b', b'\xb6\x8f\xb0\x20',
+        b'\x02\x75\x1c\xec', b'\x0b\x86\xa4\xc1', b'\xf3\x05\xd7\x19',
+    }
+
+    # Scan at multiple offsets to catch addresses at different positions
+    # Priority: 32-byte boundaries (ABI standard), then 12-byte offset (address padding), then permissive scan
+    scan_offsets = []
+
+    # 1. First scan at 32-byte word boundaries (most reliable for ABI encoding)
+    for i in range(0, len(b) - 20 + 1, 32):
+        scan_offsets.append(i)
+        # Also check at 12-byte offset within each word (where addresses appear in ABI)
+        if i + 12 + 20 <= len(b):
+            scan_offsets.append(i + 12)
+
+    # 2. Add 4-byte offset positions (after function selectors)
+    for i in range(4, min(len(b) - 20 + 1, 500), 32):  # Limit to first ~500 bytes for performance
+        if i not in scan_offsets:
+            scan_offsets.append(i)
+
+    # 3. If we haven't found much, do a more permissive scan (but skip first 4 bytes - function selector)
+    if len(scan_offsets) < 10:
+        for i in range(4, min(len(b) - 20 + 1, 1000), 4):  # Scan in 4-byte steps
+            if i not in scan_offsets:
+                scan_offsets.append(i)
+
+    # Sort offsets for ordered processing
+    scan_offsets.sort()
+
+    for i in scan_offsets:
+        if i + 20 > len(b):
+            continue
+
+        addr_bytes = b[i:i+20]
+
+        # Early rejection: check if this looks like a function signature
+        if len(addr_bytes) >= 4:
+            # Check if first 4 bytes match known function signatures
+            sig_prefix = addr_bytes[:4]
+            if sig_prefix in FUNCTION_SIGS:
+                continue
+
+            # Check if bytes match function signature patterns anywhere in the address
+            for sig in FUNCTION_SIGS:
+                if sig in addr_bytes:
+                    continue
+
+        addr = "0x" + addr_bytes.hex()
         try:
             ca = Web3.to_checksum_address(addr)
         except Exception:
             continue
-        # Skip addresses that are all zeros or have too many leading zeros
+
+        # Skip addresses that are all zeros
         if ca.endswith("0000000000000000000000000000000000000000"):
             continue
+
         # Skip addresses with excessive leading zeros (likely padding, not real addresses)
-        # Real addresses can have some leading zeros but not 12+ bytes
-        addr_bytes = b[i:i+20]
+        # Reverted to stricter threshold: 11+ leading zero bytes
+        # Real addresses can have some leading zeros but 11+ bytes is extremely rare
         leading_zero_count = 0
         for byte in addr_bytes:
             if byte == 0:
                 leading_zero_count += 1
             else:
                 break
-        if leading_zero_count > 11:  # More than 11 leading zero bytes is suspicious
+        if leading_zero_count > 11:  # Reverted to 11 from 4
             continue
+
         if ca not in seen:
-            seen.add(ca); out.append(ca)
+            seen.add(ca)
+            out.append(ca)
+
+    if debug and len(out) > 0:
+        print(f"[scan] Found {len(out)} potential token addresses: {[short_addr(a) for a in out[:5]]}")
+
     return out
 
 def decode_swap_intent(w3: Web3, tx) -> Optional[SwapIntent]:
@@ -527,10 +711,8 @@ def decode_swap_intent(w3: Web3, tx) -> Optional[SwapIntent]:
                         if token.lower().replace("0x", "") in data_hex:
                             token_out = token
                             break
-                
-                # Last resort fallback
-                if not token_out:
-                    token_out = USDC
+
+                # DO NOT fallback to USDC - removed to prevent false positives
                     
                 return SwapIntent(
                     token_in=token_in,
@@ -638,10 +820,8 @@ def decode_swap_intent(w3: Web3, tx) -> Optional[SwapIntent]:
                         if token.lower().replace("0x", "") in data_hex:
                             token_out = token
                             break
-                        
-                # Fallback to USDC if no other token found
-                if not token_out:
-                    token_out = USDC
+
+                # DO NOT fallback to USDC - removed to prevent false positives
                     
                 return SwapIntent(
                     token_in=token_in,
@@ -703,10 +883,9 @@ def decode_swap_intent(w3: Web3, tx) -> Optional[SwapIntent]:
             if common.lower() in data_hex:
                 token_out = common
                 break
-        
-        # Last resort: if we have ETH value but no token_out, assume USDC
-        if not token_out:
-            token_out = USDC
+
+        # DO NOT fallback to USDC - fail gracefully instead
+        # The old fallback created too many false positives
     
     # Final check: ensure token_in and token_out are different
     if token_in and token_out and token_in.lower() == token_out.lower():
@@ -741,8 +920,17 @@ def _try_v3_direct_roundtrip(w3: Web3, quoter, eth_in: int, token: str, fees=(50
     best = None
     for fee in fees:
         try:
-            out = int(quoter.functions.quoteExactInputSingle(WETH9, token, fee, eth_in, 0).call()[0])
-            back = int(quoter.functions.quoteExactInputSingle(token, WETH9, fee, out, 0).call()[0])
+            # Use safe_rpc_call for better retry handling
+            out_result = safe_rpc_call(quoter.functions.quoteExactInputSingle(WETH9, token, fee, eth_in, 0).call)
+            if out_result is None:
+                continue
+            out = int(out_result[0])
+
+            back_result = safe_rpc_call(quoter.functions.quoteExactInputSingle(token, WETH9, fee, out, 0).call)
+            if back_result is None:
+                continue
+            back = int(back_result[0])
+
             best = max(best or 0, back)
         except Exception:
             continue
@@ -915,16 +1103,17 @@ def validate_token_liquidity(w3: Web3, token: str, min_liquidity_wei: int = None
     Returns True if token passes validation, False otherwise.
     """
     if min_liquidity_wei is None:
-        min_liquidity_wei = Web3.to_wei(0.1, "ether")  # Reduced from 1 ETH to 0.1 ETH for more opportunities
+        min_liquidity_wei = Web3.to_wei(0.02, "ether")  # Hybrid approach: 0.02 ETH for broader opportunities with risk management
     
     # First check if this looks like a real token address
     if not is_valid_token_address(token):
         return False
     
-    # Whitelist of known good tokens that should always pass
+    # Whitelist of known good tokens that should always pass (bypass liquidity check)
+    # These are high-quality, established tokens with deep liquidity
     known_good_tokens = {
         WETH9.lower(),   # WETH
-        USDC.lower(),    # USDC  
+        USDC.lower(),    # USDC
         USDT.lower(),    # USDT
         DAI.lower(),     # DAI
         "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",  # WBTC
@@ -932,6 +1121,12 @@ def validate_token_liquidity(w3: Web3, token: str, min_liquidity_wei: int = None
         "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",  # UNI
         "0x7d1afa7b718fb893db30a3abc0cfc608aacfebb0",  # MATIC
         "0xa0b73e1ff0b80914ab6fe0444e65848c4c34450b",  # CRO
+        "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce",  # SHIB
+        "0x6982508145454ce325ddbe47a25d4ec3d2311933",  # PEPE
+        "0xae7ab96520de3a18e5e111b5eaab095312d7fe84",  # stETH (Lido)
+        "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9",  # AAVE
+        "0x0bc529c00c6401aef6d220be8c6ea1667f6ad93e",  # YFI
+        "0xc00e94cb662c3520282e6f5717214004a7f26888",  # COMP
     }
     
     if token.lower() in known_good_tokens:
@@ -983,15 +1178,17 @@ def validate_token_liquidity(w3: Web3, token: str, min_liquidity_wei: int = None
     except Exception:
         return False
 
-def is_valid_token_address(token: str) -> bool:
+def is_valid_token_address(token: str, debug: bool = False) -> bool:
     """
     Check if a token address looks legitimate and not like function signature data.
     """
     try:
         token = token.lower()
-        
+
         # Basic format check
         if not token.startswith("0x") or len(token) != 42:
+            if debug:
+                print(f"[validation] {short_addr(token)}: REJECTED - Invalid format")
             return False
         
         # Check for common function signature patterns that get misidentified as tokens
@@ -1013,40 +1210,58 @@ def is_valid_token_address(token: str) -> bool:
             "0x8803dbee",  # V2 Router swapTokensForExactTokens variant
             "0xa6886da9",  # ParaSwap function
             "0x0502b1c5",  # 1inch function
+            "0xc3cf8043",  # 1inch v6 function
+            "0x13d79a0b",  # CoW Protocol settle
+            "0xb68fb020",  # 1inch v6 function
+            "0x02751cec",  # V2 Router function
+            "0x0b86a4c1",  # ParaSwap function
+            "0xf305d719",  # V2 Router addLiquidityETH
         }
 
         # Check if it starts with known function signatures
         # Check both the full address and partial matches
         for sig in function_signatures:
             if token.startswith(sig):
+                if debug:
+                    print(f"[validation] {short_addr(token)}: REJECTED - Starts with function signature {sig}")
                 return False
             # Also check if function signature appears in middle/end (common in calldata scanning)
             sig_bytes = sig[2:].lower()  # Remove 0x prefix
             if sig_bytes in token[2:]:  # Check in address body
+                if debug:
+                    print(f"[validation] {short_addr(token)}: REJECTED - Contains function signature {sig}")
                 return False
-        
+
         # Check for patterns that indicate malformed addresses
         # - Too many repeated patterns
         # - Addresses that end with function signature patterns
         if token.count("000000000000000000000000") > 0:
+            if debug:
+                print(f"[validation] {short_addr(token)}: REJECTED - Too many zeros")
             return False
-            
+
         # Check for addresses that look like they contain function signatures
         for sig in function_signatures:
             if sig[2:] in token:  # Remove 0x and check if sig is in address
+                if debug:
+                    print(f"[validation] {short_addr(token)}: REJECTED - Contains signature bytes")
                 return False
-        
+
         # Check for other suspicious patterns
         suspicious_patterns = [
             "aa3caf",    # Part of 1inch function sig
             "ed2379",    # Part of another function sig
             "5141b82f",  # Common pattern in fake addresses
         ]
-        
+
         for pattern in suspicious_patterns:
             if pattern in token:
+                if debug:
+                    print(f"[validation] {short_addr(token)}: REJECTED - Suspicious pattern '{pattern}'")
                 return False
-        
+
+        if debug:
+            print(f"[validation] {short_addr(token)}: PASSED")
         return True
         
     except Exception:
@@ -1146,27 +1361,45 @@ def get_pool_liquidity_depth(w3: Web3, token_a: str, token_b: str) -> Dict[str, 
     return liquidity_info
 
 def calculate_optimal_position_size(
-    w3: Web3, 
-    victim_tx, 
+    w3: Web3,
+    victim_tx,
     intent: SwapIntent,
     liquidity_info: Dict[str, int]
 ) -> int:
     """
     Calculate optimal sandwich position size based on:
-    1. Victim transaction size
-    2. Pool liquidity depth  
-    3. Price impact analysis
-    4. Risk management limits
+    1. Token quality tier (whitelisted vs non-whitelisted)
+    2. Victim transaction size
+    3. Pool liquidity depth
+    4. Price impact analysis
+    5. Risk management limits
     """
     try:
+        # Whitelist for high-quality tokens
+        WHITELISTED_TOKENS = {
+            WETH9.lower(), USDC.lower(), USDT.lower(), DAI.lower(),
+            "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",  # WBTC
+            "0x514910771af9ca656af840dff83e8264ecf986ca",  # LINK
+            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",  # UNI
+        }
+
         victim_eth_in = int(victim_tx.value or 0)
         victim_amount_in = int(intent.amount_in_wei or victim_eth_in or 0)
-        
+
         if victim_amount_in <= 0:
             victim_amount_in = Web3.to_wei(0.1, "ether")
-            
-        # Base sizing: start with percentage of victim amount
-        base_size = victim_amount_in // 20  # 5% of victim
+
+        # Check if token is whitelisted
+        token_out = intent.token_out or ""
+        is_whitelisted = token_out.lower() in WHITELISTED_TOKENS
+
+        # Base sizing with tiered approach based on token quality
+        if is_whitelisted:
+            # Aggressive sizing for trusted tokens
+            base_size = victim_amount_in // 10  # 10% of victim
+        else:
+            # Conservative sizing for unverified tokens
+            base_size = victim_amount_in // 50  # 2% of victim
         
         # Adjust based on victim transaction size
         if victim_amount_in >= Web3.to_wei(10, "ether"):
@@ -1246,6 +1479,90 @@ def estimate_price_impact(w3: Web3, token_in: str, token_out: str, amount_in: in
         pass
     
     return 0.0  # Default to no impact if calculation fails
+
+# --------- Reverse swap helper (Token -> ETH) ----------
+def _try_reverse_sandwich(w3: Web3, quoter, token: str, token_amount_in: int) -> Optional[int]:
+    """
+    For Token->ETH swaps, calculate if we can front-run by buying the token with ETH,
+    then back-run by selling it back to ETH for profit.
+    Returns (eth_in, profit) tuple or None.
+    """
+    try:
+        # Step 1: Estimate how much ETH we need to buy approximately the same amount of tokens
+        # that the victim is selling (to move the price)
+        # Use a portion of the victim's sell to determine our buy size
+        my_eth_in = Web3.to_wei(0.15, "ether")  # Increased from 0.05 to 0.15 ETH base
+
+        best_profit = 0
+        best_eth_in = 0
+        best_route = None
+
+        # Try different position sizes with expanded multipliers
+        for multiplier in [0.5, 1.0, 1.5, 2.0, 3.0, 5.0]:
+            test_eth = int(my_eth_in * multiplier)
+            if test_eth > Web3.to_wei(5, "ether"):  # Increased cap from 2 to 5 ETH
+                continue
+
+            # Try V3 routes first (better pricing for liquid tokens)
+            for fee in [500, 3000, 10000]:
+                try:
+                    # Front-run: Buy token with ETH
+                    tokens_bought = int(quoter.functions.quoteExactInputSingle(
+                        WETH9, token, fee, test_eth, 0
+                    ).call()[0])
+
+                    if tokens_bought == 0:
+                        continue
+
+                    # Victim trades (moves price)
+                    # Back-run: Sell our tokens back for ETH
+                    eth_back = int(quoter.functions.quoteExactInputSingle(
+                        token, WETH9, fee, tokens_bought, 0
+                    ).call()[0])
+
+                    profit = eth_back - test_eth
+                    if profit > best_profit:
+                        best_profit = profit
+                        best_eth_in = test_eth
+                        best_route = "v3"
+
+                except Exception:
+                    continue
+
+            # Try V2 routes (fallback for tokens without V3 pools)
+            for router_addr in ALL_V2_ROUTERS:
+                try:
+                    router = w3.eth.contract(address=router_addr, abi=UNISWAP_V2_ROUTER_ABI)
+
+                    # Front-run: Buy token with ETH (WETH -> Token)
+                    tokens_bought = int(router.functions.getAmountsOut(
+                        test_eth, [WETH9, token]
+                    ).call()[-1])
+
+                    if tokens_bought == 0:
+                        continue
+
+                    # Back-run: Sell tokens back for ETH (Token -> WETH)
+                    eth_back = int(router.functions.getAmountsOut(
+                        tokens_bought, [token, WETH9]
+                    ).call()[-1])
+
+                    profit = eth_back - test_eth
+                    if profit > best_profit:
+                        best_profit = profit
+                        best_eth_in = test_eth
+                        best_route = "v2"
+
+                except Exception:
+                    continue
+
+        if best_profit > 0:
+            # Add route info to return for logging
+            return best_eth_in, best_profit, best_route
+        return None
+
+    except Exception:
+        return None
 
 # --------- Gas helpers ----------
 def _get_base_and_fees(w3: Web3, priority_gwei: int) -> Tuple[int, int]:
@@ -1392,25 +1709,61 @@ def estimate_ev_dynamic_wei(
         token_in = intent.token_in or WETH9
         token_out = intent.token_out
 
+        # Detect if this is a Token->ETH swap (reverse direction)
+        is_reverse_swap = (token_out == WETH9 or token_out.lower() == WETH9.lower())
+
+        if is_reverse_swap:
+            # Handle Token->ETH swaps (victim is selling token for ETH)
+            print(f"[debug] Detected Token->ETH swap (token={token_in}), using reverse sandwich logic")
+
+            quoter = w3.eth.contract(address=UNISWAP_V3_QUOTERV2, abi=QUOTER_V2_ABI)
+            victim_token_amount = int(intent.amount_in_wei or 0)
+
+            # Try reverse sandwich
+            result = _try_reverse_sandwich(w3, quoter, token_in, victim_token_amount)
+            if not result:
+                print(f"[debug] Reverse sandwich: no profitable opportunity found for token {token_in}")
+                return None
+
+            my_eth_in, profit, route = result
+            print(f"[debug] Reverse sandwich: eth_in={Web3.from_wei(my_eth_in, 'ether'):.4f} ETH, profit={Web3.from_wei(profit, 'ether'):.6f} ETH, route={route}")
+
+            # Calculate gas costs
+            gas_bundle = 65_000 + 70_000 + 250_000 + 70_000 + 250_000
+            gas_wei = gas_bundle * max_fee
+
+            ev_wei = profit - gas_wei
+            est_back = my_eth_in + profit
+
+            # Apply minimum profit threshold (lowered to match main.py config)
+            min_profit_threshold = Web3.to_wei(0.0005, "ether")  # Lowered from 0.001
+            if ev_wei <= min_profit_threshold:
+                print(f"[debug] Reverse sandwich: EV {Web3.from_wei(ev_wei, 'ether'):.6f} ETH below threshold")
+                return None
+
+            print(f"[debug] Reverse sandwich: SUCCESS! EV={Web3.from_wei(ev_wei, 'ether'):.4f} ETH")
+            return ev_wei, gas_wei, my_eth_in, est_back
+
+        # Normal ETH->Token swap logic (existing code)
         # Get pool liquidity information for optimal sizing
         liquidity_info = get_pool_liquidity_depth(w3, token_in, token_out)
-        
+
         # Calculate optimal position size
         optimal_size = calculate_optimal_position_size(w3, victim_tx, intent, liquidity_info)
-        
+
         # Estimate price impact for the optimal size
         price_impact = estimate_price_impact(w3, token_in, token_out, optimal_size)
-        
+
         # If price impact is too high (>15%), reduce position size
         if price_impact > 0.15:
             optimal_size = int(optimal_size * 0.7)  # Reduce by 30%
-            
+
         # Re-check with reduced size if needed
         if optimal_size < Web3.to_wei(0.02, "ether"):
             return None  # Too small to be profitable
-            
+
         my_eth_in = optimal_size
-        token = token_out        
+        token = token_out
         best_back = 0
 
         quoter = w3.eth.contract(address=UNISWAP_V3_QUOTERV2, abi=QUOTER_V2_ABI)
@@ -1462,10 +1815,10 @@ def estimate_ev_dynamic_wei(
         gas_bundle = 65_000 + 70_000 + 250_000 + 70_000 + 250_000
         gas_wei = gas_bundle * max_fee
         ev_wei = best_back - my_eth_in - gas_wei
-        
+
         # Apply minimum profit threshold (note: main.py will also check this)
         # This is just a backup check in case the estimator is called directly
-        min_profit_threshold = Web3.to_wei(0.001, "ether")  # Default fallback threshold
+        min_profit_threshold = Web3.to_wei(0.0005, "ether")  # Lowered from 0.001 to match main.py
         if ev_wei <= min_profit_threshold:
             return None
 
