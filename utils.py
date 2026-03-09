@@ -1,6 +1,7 @@
 import time
+import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Callable, TypeVar, Any
+from typing import List, Optional, Tuple, Dict, Callable, TypeVar, Any, Set
 from eth_account import Account
 from web3 import Web3
 from functools import wraps
@@ -479,11 +480,8 @@ def _scan_addresses_from_calldata(data_hex_no0x: str, debug: bool = False) -> Li
         if i not in scan_offsets:
             scan_offsets.append(i)
 
-    # 3. If we haven't found much, do a more permissive scan (but skip first 4 bytes - function selector)
-    if len(scan_offsets) < 10:
-        for i in range(4, min(len(b) - 20 + 1, 1000), 4):  # Scan in 4-byte steps
-            if i not in scan_offsets:
-                scan_offsets.append(i)
+    # Step 3 (permissive byte scan) intentionally removed — it produced too many
+    # false positives from ABI-encoded integers that look like addresses.
 
     # Sort offsets for ordered processing
     scan_offsets.sort()
@@ -526,6 +524,23 @@ def _scan_addresses_from_calldata(data_hex_no0x: str, debug: bool = False) -> Li
             else:
                 break
         if leading_zero_count > 11:  # Reverted to 11 from 4
+            continue
+
+        # Additional check: reject if too many total zeros (not just leading)
+        # From logs: addresses like 0x0000002000000000000000000000000000000000 with 80%+ zeros
+        total_zero_bytes = sum(1 for byte in addr_bytes if byte == 0)
+        if total_zero_bytes > 16:  # More than 16/20 bytes = 80% zeros
+            continue
+
+        # Reject addresses with too few unique bytes or low Shannon entropy
+        unique_byte_count = len(set(addr_bytes))
+        if unique_byte_count < 8:  # Less than 8 distinct byte values
+            continue
+        _byte_counts = {}
+        for _byt in addr_bytes:
+            _byte_counts[_byt] = _byte_counts.get(_byt, 0) + 1
+        _entropy = -sum((_c / 20) * math.log2(_c / 20) for _c in _byte_counts.values())
+        if _entropy < 3.5:
             continue
 
         if ca not in seen:
@@ -663,22 +678,21 @@ def decode_swap_intent(w3: Web3, tx) -> Optional[SwapIntent]:
             # Skip function selector (first 4 bytes)
             params_data = data_bytes[4:]
             
-            # Try to extract token addresses from the inputs
+            # Extract token addresses at ABI boundaries only (32-byte words, 12-byte offset)
+            # Avoids false positives from byte-scanning encoded integers
             token_addresses = []
-            
-            # Scan for token addresses in the calldata
-            for i in range(0, len(params_data) - 20):
-                potential_addr = "0x" + params_data[i:i+20].hex()
-                try:
-                    addr = Web3.to_checksum_address(potential_addr)
-                    # Filter for likely token addresses (not zero, not router itself)
-                    if (not addr.endswith("0000000000000000000000000000000000000000") and 
-                        addr != UNIVERSAL_ROUTER and addr != WETH9 and 
-                        len(addr) == 42):
-                        token_addresses.append(addr)
-                except Exception:
-                    continue
-            
+            for word_start in range(0, len(params_data) - 31, 32):
+                word = params_data[word_start:word_start + 32]
+                # Addresses are right-aligned in a 32-byte word: leading 12 zero bytes
+                if word[:12] == b'\x00' * 12:
+                    addr_bytes = word[12:]
+                    if len(addr_bytes) == 20 and any(b != 0 for b in addr_bytes):
+                        potential_addr = "0x" + addr_bytes.hex()
+                        try:
+                            token_addresses.append(Web3.to_checksum_address(potential_addr))
+                        except Exception:
+                            pass
+
             # Remove duplicates while preserving order
             seen = set()
             unique_tokens = []
@@ -1565,10 +1579,18 @@ def _try_reverse_sandwich(w3: Web3, quoter, token: str, token_amount_in: int) ->
         return None
 
 # --------- Gas helpers ----------
+# Track tokens whose approve has already been submitted this session
+_approved_tokens: set = set()
+
 def _get_base_and_fees(w3: Web3, priority_gwei: int) -> Tuple[int, int]:
-    base = w3.eth.gas_price  # simple approximation; for 1559 blocks you could sample baseFee
+    """Return (max_fee_per_gas, max_priority_fee) using EIP-1559 baseFee."""
+    try:
+        pending = w3.eth.get_block('pending')
+        base_fee = pending.get('baseFeePerGas') or w3.eth.gas_price
+    except Exception:
+        base_fee = w3.eth.gas_price
     max_priority = Web3.to_wei(priority_gwei, "gwei")
-    max_fee = base + max_priority
+    max_fee = base_fee + max_priority
     return max_fee, max_priority
 
 # --------- Public: basic/legacy EV (kept) ----------
@@ -1607,7 +1629,8 @@ def estimate_ev_wei(
             return None
 
         max_fee, _ = _get_base_and_fees(w3, priority_fee_gwei)
-        gas_bundle = 65_000 + 70_000 + 250_000 + 70_000 + 250_000
+        approve_gas = 5_000 if token in _approved_tokens else 70_000
+        gas_bundle = 65_000 + approve_gas + 250_000 + approve_gas + 250_000
         gas_wei = gas_bundle * max_fee
         ev_wei = best_back - my_in - gas_wei
         return ev_wei, gas_wei, my_in, best_back
@@ -1673,7 +1696,8 @@ def estimate_ev_universal_wei(
         if best_back <= 0:
             return None
 
-        gas_bundle = 65_000 + 70_000 + 250_000 + 70_000 + 250_000
+        approve_gas = 5_000 if token in _approved_tokens else 70_000
+        gas_bundle = 65_000 + approve_gas + 250_000 + approve_gas + 250_000
         gas_wei = gas_bundle * max_fee
         ev_wei = best_back - my_eth_in - gas_wei
 
@@ -1728,8 +1752,9 @@ def estimate_ev_dynamic_wei(
             my_eth_in, profit, route = result
             print(f"[debug] Reverse sandwich: eth_in={Web3.from_wei(my_eth_in, 'ether'):.4f} ETH, profit={Web3.from_wei(profit, 'ether'):.6f} ETH, route={route}")
 
-            # Calculate gas costs
-            gas_bundle = 65_000 + 70_000 + 250_000 + 70_000 + 250_000
+            # Calculate gas costs (use 5k approve gas if token already approved)
+            approve_gas = 5_000 if token_in in _approved_tokens else 70_000
+            gas_bundle = 65_000 + approve_gas + 250_000 + approve_gas + 250_000
             gas_wei = gas_bundle * max_fee
 
             ev_wei = profit - gas_wei
@@ -1812,7 +1837,8 @@ def estimate_ev_dynamic_wei(
         if best_back <= 0:
             return None
 
-        gas_bundle = 65_000 + 70_000 + 250_000 + 70_000 + 250_000
+        approve_gas = 5_000 if token in _approved_tokens else 70_000
+        gas_bundle = 65_000 + approve_gas + 250_000 + approve_gas + 250_000
         gas_wei = gas_bundle * max_fee
         ev_wei = best_back - my_eth_in - gas_wei
 
@@ -1858,11 +1884,12 @@ def build_sandwich_bundle(
         signed_wrap = w3.eth.account.sign_transaction(wrap_tx, private_key=searcher.key)
         nonce += 1
 
-        # 2) Approve WETH -> V3 Router
+        # 2) Approve WETH -> V3 Router (use minimal gas if already approved)
+        weth_approve_gas = 5_000 if WETH9 in _approved_tokens else 70_000
         approve_weth_tx = {
             "to": WETH9, "value": 0,
             "data": weth.encodeABI(fn_name="approve", args=[UNISWAP_V3_ROUTER, my_eth_in]),
-            "gas": 70_000, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": max_priority,
+            "gas": weth_approve_gas, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": max_priority,
             "nonce": nonce, "chainId": chain_id, "type": 2
         }
         signed_approve_weth = w3.eth.account.sign_transaction(approve_weth_tx, private_key=searcher.key)
@@ -1887,11 +1914,12 @@ def build_sandwich_bundle(
         signed_buy = w3.eth.account.sign_transaction(buy_tx, private_key=searcher.key)
         nonce += 1
 
-        # 4) Approve token_out -> V3 Router (for selling back)
+        # 4) Approve token_out -> V3 Router (for selling back; minimal gas if already approved)
+        token_approve_gas = 5_000 if token_out in _approved_tokens else 70_000
         approve_out_tx = {
             "to": token_out, "value": 0,
             "data": erc.encodeABI(fn_name="approve", args=[UNISWAP_V3_ROUTER, 2**256 - 1]),
-            "gas": 70_000, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": max_priority,
+            "gas": token_approve_gas, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": max_priority,
             "nonce": nonce, "chainId": chain_id, "type": 2
         }
         signed_approve_out = w3.eth.account.sign_transaction(approve_out_tx, private_key=searcher.key)
@@ -1923,7 +1951,7 @@ def build_sandwich_bundle(
         }
         signed_sell = w3.eth.account.sign_transaction(sell_tx, private_key=searcher.key)
 
-        return [
+        bundle = [
             signed_wrap.rawTransaction,
             signed_approve_weth.rawTransaction,
             signed_buy.rawTransaction,
@@ -1931,6 +1959,10 @@ def build_sandwich_bundle(
             victim_raw,
             signed_sell.rawTransaction,
         ]
+        # Optimistically mark tokens as approved so future bundles skip full approve gas
+        _approved_tokens.add(WETH9)
+        _approved_tokens.add(token_out)
+        return bundle
     except Exception:
         return None
 
