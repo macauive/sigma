@@ -1,5 +1,6 @@
 import time
 import math
+import threading
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Callable, TypeVar, Any, Set
 from eth_account import Account
@@ -128,7 +129,7 @@ def cached_quote_call(cache_key: str, func: Callable[..., T], *args, **kwargs) -
 UNISWAP_V2_ROUTER   = Web3.to_checksum_address("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")
 UNISWAP_V3_ROUTER   = Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564")
 UNISWAP_V3_PERIPH   = Web3.to_checksum_address("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")  # v3 periphery
-UNISWAP_V3_QUOTERV2 = Web3.to_checksum_address("0x61fFE014bA17989E743c5F6cB21bF9697530B21e")
+UNISWAP_V3_QUOTERV2 = Web3.to_checksum_address("0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6")  # QuoterV1 (flat args — V2 needs struct ABI)
 UNIVERSAL_ROUTER    = Web3.to_checksum_address("0xEf1c6E67703c7BD7107eed8303Fbe6EC2554BF6B")
 
 # Sushiswap
@@ -258,18 +259,17 @@ UNISWAP_V3_ROUTER_ABI = [
 ]
 
 QUOTER_V2_ABI = [
-    {"type":"function","name":"quoteExactInputSingle","stateMutability":"nonpayable",
+    # QuoterV1 ABI — address 0xb273… uses flat positional args and returns single uint256.
+    # (QuoterV2 at 0x61fF… uses a struct input and a 4-field tuple output — different ABI.)
+    {"type":"function","name":"quoteExactInputSingle","stateMutability":"view",
      "inputs":[
         {"name":"tokenIn","type":"address"},
         {"name":"tokenOut","type":"address"},
         {"name":"fee","type":"uint24"},
         {"name":"amountIn","type":"uint256"},
         {"name":"sqrtPriceLimitX96","type":"uint160"}],
-     "outputs":[
-        {"name":"amountOut","type":"uint256"},
-        {"name":"sqrtPriceX96After","type":"uint160"},
-        {"name":"initializedTicksCrossed","type":"uint32"},
-        {"name":"gasEstimate","type":"uint256"}]},
+     # Declared as uint256[1] so web3.py returns [value] — existing result[0] call sites stay intact.
+     "outputs":[{"name":"amountOut","type":"uint256[1]"}]},
 ]
 
 ERC20_ABI = [
@@ -1578,6 +1578,21 @@ def _try_reverse_sandwich(w3: Web3, quoter, token: str, token_amount_in: int) ->
     except Exception:
         return None
 
+# --------- Simulation whitelist ----------
+# High-confidence tokens: submit even if pre-submission simulation times out.
+# These are established tokens with deep, stable liquidity.
+SIM_WHITELIST: Set[str] = {
+    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
+    "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
+    "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+    "0x6b175474e89094c44da98b954eedeac495271d0f",  # DAI
+    "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",  # WBTC
+    "0x514910771af9ca656af840dff83e8264ecf986ca",  # LINK
+    "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",  # UNI
+    "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce",  # SHIB
+    "0x6982508145454ce325ddbe47a25d4ec3d2311933",  # PEPE
+}
+
 # --------- Gas helpers ----------
 # Track tokens whose approve has already been submitted this session
 _approved_tokens: set = set()
@@ -1852,6 +1867,85 @@ def estimate_ev_dynamic_wei(
     except Exception as e:
         print(f"[debug] estimate_ev_dynamic_wei exception: {type(e).__name__}: {e}")
         return None
+
+# --------- Pre-submission simulation gate ----------
+def simulate_bundle_eth_call(
+    w3_http: Web3,
+    token_out: str,
+    my_eth_in: int,
+    gas_wei: int,
+    min_profit_wei: int = 0,
+    fee: int = 3000,
+    timeout_ms: int = 150,
+) -> Optional[int]:
+    """
+    Pre-submission simulation gate. Re-quotes both sandwich legs at submission
+    time to catch pool state that moved dramatically since EV estimation.
+
+    A sandwich profits from the VICTIM's price impact, so a clean round-trip
+    will show a small loss from pool fees alone. We do NOT re-check profitability
+    here — that is already enforced by the EV estimator + MIN_PROFIT_ETH.
+    Instead we verify:
+      1. Buy route is alive (pool has liquidity, token not broken)
+      2. Sell route is alive
+      3. Round-trip slippage is ≤ 5% — if larger, the pool moved drastically
+         since estimation and the bundle would likely revert or be unprofitable
+
+    Returns eth_back (from sell quote) if routes are viable, None to reject.
+    Caller falls back to submission for SIM_WHITELIST tokens when None is returned.
+    """
+    result: list = [None]
+
+    def _run():
+        try:
+            quoter = w3_http.eth.contract(address=UNISWAP_V3_QUOTERV2, abi=QUOTER_V2_ABI)
+            token_cs = Web3.to_checksum_address(token_out)
+
+            # Step 1: buy leg
+            token_amount = 0
+            for buy_fee in [fee, 500, 3000, 10000]:
+                try:
+                    token_amount = quoter.functions.quoteExactInputSingle(
+                        WETH9, token_cs, buy_fee, my_eth_in, 0
+                    ).call()[0]
+                    if token_amount > 0:
+                        break
+                except Exception:
+                    continue
+
+            if not token_amount:
+                return  # No pool found — reject
+
+            # Step 2: sell leg
+            eth_back = 0
+            for sell_fee in [fee, 500, 3000, 10000]:
+                try:
+                    eth_back = quoter.functions.quoteExactInputSingle(
+                        token_cs, WETH9, sell_fee, token_amount, 0
+                    ).call()[0]
+                    if eth_back > 0:
+                        break
+                except Exception:
+                    continue
+
+            if not eth_back:
+                return  # Sell route broken — reject
+
+            # Step 3: slippage guard (≤ 5% round-trip loss acceptable from pool fees)
+            max_loss = my_eth_in * 5 // 100
+            if eth_back < my_eth_in - max_loss:
+                return  # Pool moved too far since estimation — reject
+
+            result[0] = eth_back
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_ms / 1000.0)
+
+    return result[0]  # None = timed out, reject or whitelist fallback
+
 
 # --------- Sandwich bundle builder (simple V3 single-hop) ----------
 def build_sandwich_bundle(

@@ -28,9 +28,11 @@ from utils import (
     estimate_ev_dynamic_wei,
     decode_swap_intent,
     build_sandwich_bundle,
+    simulate_bundle_eth_call,
     describe_tx,
     validate_token_liquidity,
     is_token_blacklisted,
+    SIM_WHITELIST,
 )
 
 # ------------ Setup ------------
@@ -562,6 +564,22 @@ def main():
             if not bundle:
                 continue
 
+            # ---- Phase 2: pre-submission simulation gate ----
+            sim_eth_back = simulate_bundle_eth_call(
+                w3_http, token_out, my_eth_in, gas_wei,
+                fee=3000, timeout_ms=150,
+            )
+            is_whitelisted = token_out.lower() in SIM_WHITELIST
+            if sim_eth_back is None:
+                if is_whitelisted:
+                    print(f"[sim] timeout/fail for whitelisted {token_out[:10]}…, submitting anyway")
+                else:
+                    ev_missed += 1
+                    print(f"[sim] rejected: simulation failed for {token_out[:10]}…")
+                    continue
+            else:
+                print(f"[sim] pass: eth_back={Web3.from_wei(sim_eth_back, 'ether'):.6f}")
+
             # Target next block
             target_block = w3.eth.block_number + 1
             try:
@@ -589,6 +607,7 @@ def main():
                     "token": token_out, "ev_wei": ev_wei, "included": included,
                     "builders": all_builders, "estimator": estimator_used,
                     "gas_wei": gas_wei, "eth_in": my_eth_in, "eth_back": back,
+                    "sim_eth_back": sim_eth_back,
                 }))
             except Exception as sb:
                 print(f"[bundle error] {sb}")
