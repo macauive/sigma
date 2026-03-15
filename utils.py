@@ -1,6 +1,8 @@
 import time
 import math
 import threading
+import json
+import requests as _requests
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Callable, TypeVar, Any, Set
 from eth_account import Account
@@ -1378,34 +1380,35 @@ def calculate_optimal_position_size(
     w3: Web3,
     victim_tx,
     intent: SwapIntent,
-    liquidity_info: Dict[str, int]
+    liquidity_info: Dict[str, int],
+    cg_api_key: str = "",
 ) -> int:
     """
-    Calculate optimal sandwich position size based on:
-    1. Token quality tier (whitelisted vs non-whitelisted)
-    2. Victim transaction size
-    3. Pool liquidity depth
-    4. Price impact analysis
-    5. Risk management limits
+    Calculate optimal sandwich position size.
+    Uses CoinGecko metadata when available to apply risk adjustments:
+    - Tokens with >10% 24h move: reduce to 50% of calculated size
+    - Non-whitelisted tokens require >$5M market cap and >$500K 24h volume
     """
     try:
-        # Whitelist for high-quality tokens
-        WHITELISTED_TOKENS = {
-            WETH9.lower(), USDC.lower(), USDT.lower(), DAI.lower(),
-            "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",  # WBTC
-            "0x514910771af9ca656af840dff83e8264ecf986ca",  # LINK
-            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",  # UNI
-        }
-
         victim_eth_in = int(victim_tx.value or 0)
         victim_amount_in = int(intent.amount_in_wei or victim_eth_in or 0)
 
         if victim_amount_in <= 0:
             victim_amount_in = Web3.to_wei(0.1, "ether")
 
-        # Check if token is whitelisted
         token_out = intent.token_out or ""
-        is_whitelisted = token_out.lower() in WHITELISTED_TOKENS
+        is_whitelisted = token_out.lower() in SIM_WHITELIST
+
+        # --- CoinGecko risk filter for non-whitelisted tokens ---
+        cg_meta = None
+        if not is_whitelisted:
+            cg_meta = get_token_metadata(token_out, cg_api_key)
+            if cg_meta:
+                mcap = cg_meta.get("market_cap_usd", 0)
+                vol   = cg_meta.get("volume_24h_usd", 0)
+                # Require minimum market cap and 24h volume
+                if mcap < 5_000_000 or vol < 500_000:
+                    return Web3.to_wei(0.02, "ether")  # minimum viable size
 
         # Base sizing with tiered approach based on token quality
         if is_whitelisted:
@@ -1444,9 +1447,17 @@ def calculate_optimal_position_size(
         max_size = min(max_size, victim_amount_in)
         
         optimal_size = max(min_size, min(base_size, max_size))
-        
-        return int(optimal_size)
-        
+
+        # CoinGecko volatility adjustment: high 24h move → reduce position
+        if cg_meta is None and not is_whitelisted:
+            cg_meta = get_token_metadata(token_out, cg_api_key)
+        if cg_meta:
+            change_pct = abs(cg_meta.get("price_change_24h_pct", 0.0))
+            if change_pct > 10.0:
+                optimal_size = int(optimal_size * 0.5)  # halve size for volatile tokens
+
+        return int(max(min_size, optimal_size))
+
     except Exception:
         # Fallback to conservative sizing
         return Web3.to_wei(0.05, "ether")
@@ -1593,20 +1604,133 @@ SIM_WHITELIST: Set[str] = {
     "0x6982508145454ce325ddbe47a25d4ec3d2311933",  # PEPE
 }
 
+# --------- Data-driven token list (updated weekly by update_profitable_tokens.py) ----------
+import os as _os
+
+def load_profitable_tokens(path: str = "profitable_tokens.json") -> Set[str]:
+    """Load data-driven token whitelist. Falls back to SIM_WHITELIST on error."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        tokens = {t.lower() for t in data.get("tokens", [])}
+        if tokens:
+            return tokens
+    except Exception:
+        pass
+    return set(SIM_WHITELIST)
+
+# --------- CoinGecko token metadata (5-min TTL cache) ----------
+_CG_BASE = "https://api.coingecko.com/api/v3"
+_cg_cache: Dict[str, Tuple[dict, float]] = {}  # address -> (data, timestamp)
+_CG_TTL = 300  # 5 minutes
+
+# CoinGecko needs its own address → coin-id mapping for the simple/price endpoint.
+# We maintain a small lookup for common tokens; unknown tokens get a contract lookup.
+_CG_ADDRESS_TO_ID: Dict[str, str] = {
+    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "ethereum",
+    "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "usd-coin",
+    "0xdac17f958d2ee523a2206206994597c13d831ec7": "tether",
+    "0x6b175474e89094c44da98b954eedeac495271d0f": "dai",
+    "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599": "wrapped-bitcoin",
+    "0x514910771af9ca656af840dff83e8264ecf986ca": "chainlink",
+    "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984": "uniswap",
+    "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce": "shiba-inu",
+    "0x6982508145454ce325ddbe47a25d4ec3d2311933": "pepe",
+    "0xae7ab96520de3a18e5e111b5eaab095312d7fe84": "staked-ether",
+}
+
+def get_token_metadata(token_address: str, cg_api_key: str = "") -> Optional[dict]:
+    """
+    Fetch CoinGecko metadata for a token: price_usd, market_cap_usd,
+    volume_24h_usd, price_change_24h_pct. Returns None on failure.
+    Cached for 5 minutes.
+    """
+    addr = token_address.lower()
+    now = time.time()
+    if addr in _cg_cache:
+        data, ts = _cg_cache[addr]
+        if now - ts < _CG_TTL:
+            return data
+
+    try:
+        headers = {"x-cg-pro-api-key": cg_api_key} if cg_api_key else {}
+
+        coin_id = _CG_ADDRESS_TO_ID.get(addr)
+        if not coin_id:
+            # Resolve via contract lookup (costs one API call)
+            r = _requests.get(
+                f"{_CG_BASE}/coins/ethereum/contract/{addr}",
+                headers=headers, timeout=4,
+            )
+            if r.status_code != 200:
+                return None
+            coin_id = r.json().get("id")
+            if coin_id:
+                _CG_ADDRESS_TO_ID[addr] = coin_id
+            else:
+                return None
+
+        r2 = _requests.get(
+            f"{_CG_BASE}/simple/price",
+            params={
+                "ids": coin_id,
+                "vs_currencies": "usd",
+                "include_market_cap": "true",
+                "include_24hr_vol": "true",
+                "include_24hr_change": "true",
+            },
+            headers=headers,
+            timeout=4,
+        )
+        if r2.status_code != 200:
+            return None
+
+        raw = r2.json().get(coin_id, {})
+        result = {
+            "price_usd":           raw.get("usd", 0),
+            "market_cap_usd":      raw.get("usd_market_cap", 0),
+            "volume_24h_usd":      raw.get("usd_24h_vol", 0),
+            "price_change_24h_pct": raw.get("usd_24h_change", 0.0),
+        }
+        _cg_cache[addr] = (result, now)
+        return result
+    except Exception:
+        return None
+
 # --------- Gas helpers ----------
 # Track tokens whose approve has already been submitted this session
 _approved_tokens: set = set()
 
 def _get_base_and_fees(w3: Web3, priority_gwei: int) -> Tuple[int, int]:
-    """Return (max_fee_per_gas, max_priority_fee) using EIP-1559 baseFee."""
+    """Return (max_fee_per_gas, max_priority_fee) using eth_feeHistory 3-block rolling average."""
+    try:
+        fh = w3.eth.fee_history(5, 'latest', [50])
+        bases = fh.get('baseFeePerGas', [])
+        # Average of last 3 confirmed blocks (list has n+1 entries, last is pending estimate)
+        if bases and len(bases) >= 4:
+            avg_base = sum(int(b) for b in bases[-4:-1]) // 3
+        elif bases:
+            avg_base = int(bases[-1])
+        else:
+            raise ValueError("empty feeHistory")
+        # Use the p50 miner tip from recent blocks, floored at priority_gwei
+        rewards = fh.get('reward', [])
+        median_tip = 0
+        for blk_rewards in rewards:
+            if blk_rewards:
+                median_tip = max(median_tip, int(blk_rewards[0]))
+        max_priority = max(Web3.to_wei(priority_gwei, "gwei"), median_tip)
+        return avg_base + max_priority, max_priority
+    except Exception:
+        pass
+    # Fallback: pending block baseFee
     try:
         pending = w3.eth.get_block('pending')
-        base_fee = pending.get('baseFeePerGas') or w3.eth.gas_price
+        base_fee = int(pending.get('baseFeePerGas') or w3.eth.gas_price)
     except Exception:
-        base_fee = w3.eth.gas_price
+        base_fee = int(w3.eth.gas_price)
     max_priority = Web3.to_wei(priority_gwei, "gwei")
-    max_fee = base_fee + max_priority
-    return max_fee, max_priority
+    return base_fee + max_priority, max_priority
 
 # --------- Public: basic/legacy EV (kept) ----------
 def estimate_ev_wei(
@@ -1731,6 +1855,7 @@ def estimate_ev_dynamic_wei(
     victim_tx,
     *,
     priority_fee_gwei: int = 1,
+    cg_api_key: str = "",
 ) -> Optional[Tuple[int, int, int, int]]:
     """
     Advanced EV estimator with dynamic position sizing based on pool liquidity and price impact.
@@ -1789,7 +1914,7 @@ def estimate_ev_dynamic_wei(
         liquidity_info = get_pool_liquidity_depth(w3, token_in, token_out)
 
         # Calculate optimal position size
-        optimal_size = calculate_optimal_position_size(w3, victim_tx, intent, liquidity_info)
+        optimal_size = calculate_optimal_position_size(w3, victim_tx, intent, liquidity_info, cg_api_key=cg_api_key)
 
         # Estimate price impact for the optimal size
         price_impact = estimate_price_impact(w3, token_in, token_out, optimal_size)

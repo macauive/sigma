@@ -33,6 +33,7 @@ from utils import (
     validate_token_liquidity,
     is_token_blacklisted,
     SIM_WHITELIST,
+    load_profitable_tokens,
 )
 
 # ------------ Setup ------------
@@ -51,6 +52,7 @@ FLASHBOTS_KEY = os.getenv("FLASHBOTS_KEY")
 BEAVER_API_KEY = os.getenv("BEAVER_API_KEY", "")
 TITAN_API_KEY = os.getenv("TITAN_API_KEY", "")
 BLOXROUTE_API_KEY = os.getenv("BLOXROUTE_API_KEY", "")
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 
 # Optional tuning parameters
 MIN_PROFIT_ETH = float(os.getenv("MIN_PROFIT_ETH", "0.0005"))  # Lowered from 0.001 to 0.0005 ETH to find more opportunities
@@ -102,6 +104,10 @@ else:
 print(f"[boot] chain={w3.eth.chain_id} searcher={searcher.address}")
 print(f"[rpc] ws  ={current_ws_url}")
 print(f"[config] MIN_PROFIT_ETH={MIN_PROFIT_ETH}, PRIORITY_FEE_GWEI={PRIORITY_FEE_GWEI}, DRY_RUN={DRY_RUN}")
+
+# Load data-driven token whitelist (falls back to static SIM_WHITELIST)
+PROFITABLE_TOKENS = load_profitable_tokens("profitable_tokens.json")
+print(f"[boot] Token whitelist: {len(PROFITABLE_TOKENS)} tokens loaded")
 
 # ------------ Caching & Optimization ------------
 @lru_cache(maxsize=2000)
@@ -506,7 +512,7 @@ def main():
 
             # Try dynamic sizing first (most advanced), then fallback to other methods
             # Use HTTP provider to avoid rate limits on WebSocket
-            res = estimate_ev_dynamic_wei(w3_http, tx, priority_fee_gwei=PRIORITY_FEE_GWEI)
+            res = estimate_ev_dynamic_wei(w3_http, tx, priority_fee_gwei=PRIORITY_FEE_GWEI, cg_api_key=COINGECKO_API_KEY)
             estimator_used = "dynamic"
             if res is None:
                 # Fallback to strict estimator
@@ -569,7 +575,7 @@ def main():
                 w3_http, token_out, my_eth_in, gas_wei,
                 fee=3000, timeout_ms=150,
             )
-            is_whitelisted = token_out.lower() in SIM_WHITELIST
+            is_whitelisted = token_out.lower() in PROFITABLE_TOKENS
             if sim_eth_back is None:
                 if is_whitelisted:
                     print(f"[sim] timeout/fail for whitelisted {token_out[:10]}…, submitting anyway")
