@@ -9,7 +9,7 @@ python-dotenv = "*"
 requests = "*"
 aiohttp = "*"
 websocket-client = "*"
-web3-flashbots = "*"
+flashbots = "*"
 
 [dev-packages]
 
