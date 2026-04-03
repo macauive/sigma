@@ -36,7 +36,29 @@ from utils import (
     load_profitable_tokens,
 )
 
-# ------------ Setup ------------
+# ------------ Setup & Logging ------------
+import logging
+from logging.handlers import RotatingFileHandler
+
+# Configure logging to both file and console
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# File handler - logs to sigma.log
+file_handler = RotatingFileHandler('sigma.log', maxBytes=10*1024*1024, backupCount=5)
+file_handler.setFormatter(log_formatter)
+file_handler.setLevel(logging.INFO)
+
+# Console handler - logs to stdout
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+console_handler.setLevel(logging.INFO)
+
+# Root logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
 load_dotenv("private.env")
 
 # Use WebSocket endpoints with multiple fallbacks (Alchemy/Infura/QuickNode etc.)
@@ -60,12 +82,12 @@ PRIORITY_FEE_GWEI = int(os.getenv("PRIORITY_FEE_GWEI", "1"))   # Default 1 gwei 
 DRY_RUN = bool(int(os.getenv("DRY_RUN", "0")))                # Default false (actually execute trades)
 
 # Build list of available WebSocket URLs
-WS_URLS = [url for url in [ETH_WS_URL, ETH_WS_URL_FALLBACK, ETH_WS_URL_FALLBACK2] if url and url.startswith(("ws://", "wss://"))]
+WS_URLS = [url for url in [ETH_WS_URL_FALLBACK, ETH_WS_URL_FALLBACK2, ETH_WS_URL] if url and url.startswith(("ws://", "wss://"))]
 
 if not PRIVATE_KEY or not FLASHBOTS_KEY:
     raise RuntimeError("Missing PRIVATE_KEY or FLASHBOTS_KEY in environment.")
 if not WS_URLS:
-    raise RuntimeError("Set at least one valid WebSocket URL (ETH_WS_URL, ETH_WS_URL_FALLBACK, ETH_WS_URL_FALLBACK2).")
+    raise RuntimeError("Set at least one valid WebSocket URL (ETH_WS_URL_FALLBACK, ETH_WS_URL_FALLBACK2, ETH_WS_URL).")
 
 # Web3 over WebSocket with fallback capability
 current_ws_index = 0
@@ -155,20 +177,21 @@ def is_obviously_invalid_token(token: str) -> bool:
 # ------------ Multi-Builder Configuration ------------
 class MEVBuilder:
     def __init__(self, name: str, endpoint: str, requires_auth: bool = False, auth_header: str = None,
-                 auth_type: str = None, api_key: str = None):
+                 auth_type: str = None, api_key: str = None, priority: int = 100):
         self.name = name
         self.endpoint = endpoint
         self.requires_auth = requires_auth
         self.auth_header = auth_header
         self.auth_type = auth_type  # "flashbots_sig", "bearer", or None
         self.api_key = api_key
+        self.priority = priority  # Lower = higher priority
         self.success_count = 0
         self.total_submissions = 0
         self.last_success_time = 0
-        
+
     def get_success_rate(self) -> float:
         return self.success_count / max(1, self.total_submissions)
-        
+
     def record_submission(self, success: bool):
         self.total_submissions += 1
         if success:
@@ -178,14 +201,37 @@ class MEVBuilder:
 # MEV Builder endpoints
 # Beaver/Titan accept Flashbots-compatible X-Flashbots-Signature (signed by fb_signer — no separate key needed).
 # bloXroute requires a Bearer token; skip if BLOXROUTE_API_KEY is unset.
+# Builder priority: lower = higher preference for bundle submission
 BUILDERS = {
-    "flashbots": MEVBuilder("Flashbots", "https://relay.flashbots.net", True),
-    "beaver": MEVBuilder("Beaver Build", "https://buildai.net", True, auth_type="flashbots_sig"),
-    "titan": MEVBuilder("Titan Builder", "https://rpc.titanbuilder.xyz", True, auth_type="flashbots_sig"),
-    "bloxroute": MEVBuilder("bloXroute", "https://mev.api.blxrbdn.com",
-                            requires_auth=bool(BLOXROUTE_API_KEY), auth_type="bearer",
-                            api_key=BLOXROUTE_API_KEY or None),
-    "eden": MEVBuilder("Eden Network", "https://api.edennetwork.io/v1", False),
+    "bloxroute": MEVBuilder(
+        "bloXroute", "https://mev.api.blxrbdn.com",
+        requires_auth=bool(BLOXROUTE_API_KEY),
+        auth_type="bearer",
+        api_key=BLOXROUTE_API_KEY or None,
+        priority=10,
+    ),
+    "beaver": MEVBuilder(
+        "Beaver Build", "https://buildai.net",
+        True,
+        auth_type="flashbots_sig",
+        priority=20,
+    ),
+    "titan": MEVBuilder(
+        "Titan Builder", "https://rpc.titanbuilder.xyz",
+        True,
+        auth_type="flashbots_sig",
+        priority=30,
+    ),
+    "flashbots": MEVBuilder(
+        "Flashbots", "https://relay.flashbots.net",
+        True,
+        priority=40,
+    ),
+    "eden": MEVBuilder(
+        "Eden Network", "https://api.edennetwork.io/v1",
+        False,
+        priority=50,
+    ),
 }
 
 _configured = [n for n, b in BUILDERS.items()
@@ -223,48 +269,52 @@ def start_ws_thread():
         global current_ws_index, current_ws_url, w3
         print(f"[ws error] {error}")
         
-        # Check for rate limiting in WebSocket error
+        # Check for ANY RPC error that indicates provider issues
+        # Updated error handling to cover more scenarios and cycle providers
         error_str = str(error).lower()
-        if any(phrase in error_str for phrase in ["429", "too many requests", "quota", "limit exceeded"]):
-            print(f"[ws] Rate limit detected in error, switching providers...")
-            if current_ws_index < len(WS_URLS) - 1:
-                current_ws_index += 1
-            else:
-                current_ws_index = 0
-                print(f"[ws] All providers exhausted, cycling back with delay...")
-            
+        error_indicators = [
+            "429", "too many requests", "quota", "limit exceeded", "internal error",
+            "connection", "timeout", "refused", "reset", "broken pipe", "eof",
+            "ssl", "handshake", "unreachable", "wsdisconnected"
+        ]
+
+        if any(phrase in error_str for phrase in error_indicators):
+            print(f"[ws error] Detected error: {error_str[:80]}. Switching providers...")
+            next_provider_index = (current_ws_index + 1) % len(WS_URLS)
+            current_ws_index = next_provider_index
             current_ws_url = WS_URLS[current_ws_index]
             print(f"[ws] Switching to provider {current_ws_index + 1}: {current_ws_url}")
             
-            # Update main Web3 instance
             try:
                 w3.provider = WebsocketProvider(current_ws_url, websocket_timeout=60)
                 print(f"[ws] Updated Web3 provider to {current_ws_url}")
             except Exception as e:
-                print(f"[ws] Failed to update Web3 provider: {e}")
+                print(f"[ws] Failed to update Web3 provider: {e}. Retrying in 5s...")
+                time.sleep(5)
+        else:
+            print(f"[ws] Unhandled error: {error}")
 
     def on_close(ws, code, msg):
         global current_ws_index, current_ws_url, w3
         print(f"[ws close] code={code} msg={msg}")
         
-        # Check for rate limiting in close message
-        if code == 1008 or (msg and "too many requests" in str(msg).lower()):
-            print(f"[ws] Rate limit detected in close, switching providers...")
-            if current_ws_index < len(WS_URLS) - 1:
-                current_ws_index += 1
-            else:
-                current_ws_index = 0
-                print(f"[ws] All providers exhausted, will retry after delay...")
-            
+        close_msg_lower = str(msg or "").lower()
+        # Aggressively switch on common close codes or rate limit messages
+        if code == 1008 or any(phrase in close_msg_lower for phrase in ["too many requests", "quota", "limit exceeded", "invalid subscription", "rate limit"]):
+            print(f"[ws close] Critical error or rate limit detected. Switching providers...")
+            next_provider_index = (current_ws_index + 1) % len(WS_URLS)
+            current_ws_index = next_provider_index
             current_ws_url = WS_URLS[current_ws_index] 
             print(f"[ws] Switching to provider {current_ws_index + 1}: {current_ws_url}")
             
-            # Update main Web3 instance
             try:
                 w3.provider = WebsocketProvider(current_ws_url, websocket_timeout=60)
                 print(f"[ws] Updated Web3 provider to {current_ws_url}")
             except Exception as e:
-                print(f"[ws] Failed to update Web3 provider: {e}")
+                print(f"[ws] Failed to update Web3 provider: {e}. Retrying in 5s...")
+                time.sleep(5)
+        else:
+            print(f"[ws] Normal close or unhandled error: code={code}, msg={msg}")
 
     def run():
         global current_ws_index, current_ws_url, w3
@@ -409,8 +459,8 @@ def submit_bundle_multi_builder(bundle: list, target_block: int, priority_fee_gw
         if success_rate > 0.1 or builder.total_submissions < 10 or recent_success:
             active_builders.append(name)
     
-    # Limit to top 4 builders to avoid spam
-    active_builders = active_builders[:4]
+    # Prefer higher-priority builders and limit to top 4 to avoid spam
+    active_builders = sorted(active_builders, key=lambda name: BUILDERS[name].priority)[:4]
 
     print(f"[multi-builder] Submitting to: {', '.join(active_builders)} (blocks {target_block}, {target_block+1})")
 

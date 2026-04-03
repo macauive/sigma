@@ -53,4 +53,4 @@ Thumbs.db
 bundles/
 transactions/
 dev_plan.txt
-*.backup
+*.backup.env
