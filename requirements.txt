@@ -14,3 +14,9 @@ aiohttp>=3.9.0
 
 # WebSocket support
 websocket-client>=1.6.0
+
+# Coinbase Advanced Trade SDK
+coinbase-advanced-py>=1.8.2
+
+# AI advisor
+openai>=2.0.0

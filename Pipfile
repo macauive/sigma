@@ -10,6 +10,8 @@ requests = "*"
 aiohttp = "*"
 websocket-client = "*"
 web3-flashbots = "*"
+coinbase-advanced-py = "*"
+openai = "*"
 
 [dev-packages]
 
