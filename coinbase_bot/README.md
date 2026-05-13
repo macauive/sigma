@@ -1,9 +1,9 @@
 # Coinbase Bot
 
-This branch adds a Coinbase Advanced Trade bot scaffold. It is dry-run first:
-the bot can fetch public candle data, build a deterministic baseline signal,
-optionally ask OpenAI for a risk-aware refinement, pass the result through local
-risk controls, and print the order it would place.
+This repository runs a Coinbase Advanced Trade bot. It is dry-run first: the bot
+can fetch public candle data, build a deterministic baseline signal, optionally
+ask OpenAI for a risk-aware refinement, pass the result through local risk
+controls, and print the order it would place.
 
 ## Setup
 
@@ -22,7 +22,7 @@ risk controls, and print the order it would place.
 3. Run one dry-run cycle:
 
    ```bash
-   COINBASE_LOOP_INTERVAL_SECONDS=0 python run_coinbase_bot.py
+   COINBASE_LOOP_INTERVAL_SECONDS=0 python main.py
    ```
 
 4. Run the focused safety tests:
