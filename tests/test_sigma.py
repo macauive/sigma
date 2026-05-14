@@ -2,7 +2,9 @@ from decimal import Decimal
 from unittest import TestCase, main
 
 from config import BotConfig, has_real_secret
-from models import TradeSignal
+from backtester import CoinbaseBacktester
+from models import Candle, TradeSignal
+from paper_trading import PaperTradingLedger
 from risk import RiskManager
 
 
@@ -24,8 +26,13 @@ def _config(**overrides):
         "max_daily_loss_usd": Decimal("25.00"),
         "min_confidence": 0.62,
         "fee_bps": Decimal("80"),
+        "slippage_bps": Decimal("10"),
         "sell_base_size": None,
         "allow_sells": False,
+        "paper_trading_enabled": True,
+        "paper_ledger_path": "paper_trades.jsonl",
+        "paper_starting_usd": Decimal("1000.00"),
+        "paper_starting_base": Decimal("0"),
     }
     values.update(overrides)
     return BotConfig(**values)
@@ -87,6 +94,57 @@ class RiskManagerTests(TestCase):
 
         self.assertFalse(decision.allowed)
         self.assertIn("SELL blocked", decision.reason)
+
+
+class PaperTradingTests(TestCase):
+    def test_paper_ledger_tracks_fake_balances(self):
+        ledger = PaperTradingLedger(
+            path=None,
+            starting_usd=Decimal("100.00"),
+            starting_base=Decimal("0"),
+            fee_bps=Decimal("100"),
+            slippage_bps=Decimal("0"),
+        )
+        signal = TradeSignal(
+            product_id="BTC-USD",
+            action="BUY",
+            confidence=0.90,
+            quote_size=Decimal("10.00"),
+            reason="test",
+            source="test",
+        )
+
+        result = ledger.apply_signal(signal, Decimal("1000"))
+
+        self.assertTrue(result.filled)
+        self.assertEqual(result.cash_usd, Decimal("90.00"))
+        self.assertEqual(result.base_size, Decimal("0.0099"))
+
+
+class BacktesterTests(TestCase):
+    def test_backtester_reports_scoreboard_metrics(self):
+        candles = [
+            Candle(
+                start=1_700_000_000 + index * 300,
+                low=Decimal(100 + index),
+                high=Decimal(101 + index),
+                open=Decimal(100 + index),
+                close=Decimal(100 + index),
+                volume=Decimal("10"),
+            )
+            for index in range(70)
+        ]
+
+        report = CoinbaseBacktester(
+            _config(min_confidence=0.50, fee_bps=Decimal("0"), slippage_bps=Decimal("0")),
+            initial_usd=Decimal("1000"),
+            min_history=60,
+        ).run(candles)
+
+        self.assertEqual(report.product_id, "BTC-USD")
+        self.assertEqual(report.candle_count, 70)
+        self.assertGreaterEqual(report.trade_count, 0)
+        self.assertIsInstance(report.total_return_pct, float)
 
 
 if __name__ == "__main__":

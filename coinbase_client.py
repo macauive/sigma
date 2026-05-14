@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -66,7 +67,16 @@ class CoinbaseBroker:
     def get_candles(self, product_id: str, granularity: str, limit: int) -> list[Candle]:
         end = int(time.time())
         start = end - self._granularity_seconds(granularity) * limit
+        return self.get_candles_between(product_id, granularity, start, end, limit)
 
+    def get_candles_between(
+        self,
+        product_id: str,
+        granularity: str,
+        start: int,
+        end: int,
+        limit: int,
+    ) -> list[Candle]:
         try:
             response = self.client.get_public_candles(
                 product_id=product_id,
@@ -81,6 +91,76 @@ class CoinbaseBroker:
             candles = self._get_public_candles_http(product_id, granularity, start, end, limit)
 
         return sorted((Candle.from_mapping(c) for c in candles), key=lambda candle: candle.start)
+
+    def get_historical_candles(
+        self,
+        product_id: str,
+        granularity: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[Candle]:
+        start_ts = int(start.timestamp())
+        end_ts = int(end.timestamp())
+        if end_ts <= start_ts:
+            raise ValueError("Historical candle end must be after start.")
+
+        granularity_seconds = self._granularity_seconds(granularity)
+        max_limit = 300
+        window_seconds = granularity_seconds * max_limit
+        candles_by_start: dict[int, Candle] = {}
+        cursor = start_ts
+        while cursor < end_ts:
+            window_end = min(cursor + window_seconds, end_ts)
+            for candle in self.get_candles_between(
+                product_id=product_id,
+                granularity=granularity,
+                start=cursor,
+                end=window_end,
+                limit=max_limit,
+            ):
+                candles_by_start[candle.start] = candle
+            cursor = window_end
+
+        return [candles_by_start[key] for key in sorted(candles_by_start)]
+
+    def get_balances(self) -> dict[str, Decimal]:
+        if not self.config.has_coinbase_credentials:
+            return {}
+
+        response = self.client.get_accounts()
+        raw = _to_plain_dict(response)
+        balances: dict[str, Decimal] = {}
+        for account in raw.get("accounts", []):
+            currency = str(account.get("currency", "")).upper()
+            available = account.get("available_balance", {})
+            value = available.get("value", "0") if isinstance(available, dict) else "0"
+            if currency:
+                balances[currency] = Decimal(str(value))
+        return balances
+
+    def get_product_limits(self, product_id: str) -> dict[str, Decimal]:
+        try:
+            response = self.client.get_product(product_id)
+            raw = _to_plain_dict(response)
+        except Exception:
+            response = requests.get(
+                f"{PUBLIC_API_BASE}/products/{product_id}",
+                timeout=10,
+            )
+            response.raise_for_status()
+            raw = response.json()
+
+        fields = {
+            "base_min_size": "0",
+            "base_max_size": "0",
+            "quote_increment": "0",
+            "base_increment": "0",
+            "quote_min_size": "0",
+        }
+        return {
+            key: Decimal(str(raw.get(key, default) or default))
+            for key, default in fields.items()
+        }
 
     def submit_market_order(self, signal: TradeSignal) -> OrderResult:
         request = self._build_order_request(signal)

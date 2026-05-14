@@ -31,10 +31,20 @@ Run tests:
 python -m unittest tests/test_sigma.py
 ```
 
+Run a historical backtest:
+
+```bash
+python backtester.py --start 2026-01-01T00:00:00Z --end 2026-02-01T00:00:00Z
+```
+
+The backtester fetches Coinbase candles, replays the deterministic strategy,
+applies the configured fee and slippage assumptions, and reports PnL, max
+drawdown, win rate, trade count, and a Sharpe-like score.
+
 Run a compile check:
 
 ```bash
-python -m py_compile main.py ai_advisor.py coinbase_client.py config.py indicators.py models.py risk.py strategy.py tests/test_sigma.py
+python -m py_compile main.py ai_advisor.py backtester.py coinbase_client.py config.py indicators.py models.py paper_trading.py portfolio.py risk.py strategy.py tests/test_sigma.py
 ```
 
 ## Safety Defaults
@@ -44,3 +54,4 @@ python -m py_compile main.py ai_advisor.py coinbase_client.py config.py indicato
 - `COINBASE_MAX_TRADE_SIZE_USD` caps order size.
 - `COINBASE_MAX_TRADES_PER_DAY` caps daily order count.
 - The OpenAI advisor is optional and never bypasses local risk checks.
+- Dry-run mode can write a paper-trading ledger to `paper_trades.jsonl`.

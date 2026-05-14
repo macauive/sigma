@@ -77,8 +77,13 @@ class BotConfig:
     max_daily_loss_usd: Decimal
     min_confidence: float
     fee_bps: Decimal
+    slippage_bps: Decimal
     sell_base_size: Decimal | None
     allow_sells: bool
+    paper_trading_enabled: bool
+    paper_ledger_path: str
+    paper_starting_usd: Decimal
+    paper_starting_base: Decimal
 
     @property
     def has_coinbase_credentials(self) -> bool:
@@ -117,6 +122,11 @@ def load_config(env_path: str = "coinbase.env") -> BotConfig:
         max_daily_loss_usd=_env_decimal("COINBASE_MAX_DAILY_LOSS_USD", "25.00"),
         min_confidence=float(os.getenv("COINBASE_MIN_CONFIDENCE", "0.62")),
         fee_bps=_env_decimal("COINBASE_FEE_BPS", "80"),
+        slippage_bps=_env_decimal("COINBASE_SLIPPAGE_BPS", "10"),
         sell_base_size=Decimal(sell_size_raw) if sell_size_raw else None,
         allow_sells=_env_bool("COINBASE_ALLOW_SELLS", False),
+        paper_trading_enabled=_env_bool("PAPER_TRADING_ENABLED", True),
+        paper_ledger_path=os.getenv("PAPER_TRADING_LEDGER_PATH", "paper_trades.jsonl").strip(),
+        paper_starting_usd=_env_decimal("PAPER_TRADING_STARTING_USD", "1000.00"),
+        paper_starting_base=_env_decimal("PAPER_TRADING_STARTING_BASE", "0"),
     )
