@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from .models import Candle
+from models import Candle
 
 
 def simple_moving_average(values: list[Decimal], period: int) -> float | None:

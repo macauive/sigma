@@ -4,8 +4,8 @@ import json
 from decimal import Decimal
 from typing import Any
 
-from .config import BotConfig
-from .models import MarketSnapshot, TradeSignal
+from config import BotConfig
+from models import MarketSnapshot, TradeSignal
 
 
 class AIAdvisor:

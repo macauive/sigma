@@ -1,9 +1,9 @@
 from decimal import Decimal
 from unittest import TestCase, main
 
-from coinbase_bot.config import BotConfig, has_real_secret
-from coinbase_bot.models import TradeSignal
-from coinbase_bot.risk import RiskManager
+from config import BotConfig, has_real_secret
+from models import TradeSignal
+from risk import RiskManager
 
 
 def _config(**overrides):

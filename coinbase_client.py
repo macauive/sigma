@@ -7,9 +7,9 @@ from typing import Any
 
 import requests
 
-from .config import BotConfig
-from .indicators import build_indicator_snapshot
-from .models import Candle, MarketSnapshot, OrderResult, TradeSignal
+from config import BotConfig
+from indicators import build_indicator_snapshot
+from models import Candle, MarketSnapshot, OrderResult, TradeSignal
 
 PUBLIC_API_BASE = "https://api.coinbase.com/api/v3/brokerage/market"
 

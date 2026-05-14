@@ -28,7 +28,13 @@ COINBASE_LOOP_INTERVAL_SECONDS=0 python main.py
 Run tests:
 
 ```bash
-python -m unittest tests/test_coinbase_bot.py
+python -m unittest tests/test_sigma.py
+```
+
+Run a compile check:
+
+```bash
+python -m py_compile main.py ai_advisor.py coinbase_client.py config.py indicators.py models.py risk.py strategy.py tests/test_sigma.py
 ```
 
 ## Safety Defaults

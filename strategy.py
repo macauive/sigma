@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from .config import BotConfig
-from .models import MarketSnapshot, TradeSignal
+from config import BotConfig
+from models import MarketSnapshot, TradeSignal
 
 
 class RuleBasedStrategy:

@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
-from .config import BotConfig
-from .models import RiskDecision, TradeSignal
+from config import BotConfig
+from models import RiskDecision, TradeSignal
 
 
 @dataclass
