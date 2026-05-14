@@ -33,6 +33,10 @@ class RiskManager:
                 signal,
             )
 
+        regime = str(signal.metadata.get("regime", "")).lower()
+        if signal.action == "BUY" and regime in self.config.blocked_buy_regimes:
+            return RiskDecision(False, f"BUY blocked in {regime} regime.", signal)
+
         if signal.quote_size > self.config.max_trade_size_usd:
             adjusted = TradeSignal(
                 product_id=signal.product_id,

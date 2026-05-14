@@ -38,6 +38,11 @@ def _env_decimal(name: str, default: str) -> Decimal:
     return Decimal(raw.strip())
 
 
+def _env_list(name: str, default: str) -> tuple[str, ...]:
+    raw = os.getenv(name, default)
+    return tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
 def _clean_secret(value: str | None) -> str:
     if value is None:
         return ""
@@ -73,9 +78,11 @@ class BotConfig:
     ai_enabled: bool
     quote_trade_size_usd: Decimal
     max_trade_size_usd: Decimal
+    max_position_exposure_pct: Decimal
     max_trades_per_day: int
     max_daily_loss_usd: Decimal
     min_confidence: float
+    blocked_buy_regimes: tuple[str, ...]
     fee_bps: Decimal
     slippage_bps: Decimal
     sell_base_size: Decimal | None
@@ -84,6 +91,7 @@ class BotConfig:
     paper_ledger_path: str
     paper_starting_usd: Decimal
     paper_starting_base: Decimal
+    journal_path: str
 
     @property
     def has_coinbase_credentials(self) -> bool:
@@ -118,9 +126,11 @@ def load_config(env_path: str = "coinbase.env") -> BotConfig:
         ai_enabled=_env_bool("ENABLE_AI_ADVISOR", True),
         quote_trade_size_usd=_env_decimal("COINBASE_QUOTE_TRADE_SIZE_USD", "10.00"),
         max_trade_size_usd=_env_decimal("COINBASE_MAX_TRADE_SIZE_USD", "25.00"),
+        max_position_exposure_pct=_env_decimal("COINBASE_MAX_POSITION_EXPOSURE_PCT", "35"),
         max_trades_per_day=_env_int("COINBASE_MAX_TRADES_PER_DAY", 6),
         max_daily_loss_usd=_env_decimal("COINBASE_MAX_DAILY_LOSS_USD", "25.00"),
         min_confidence=float(os.getenv("COINBASE_MIN_CONFIDENCE", "0.62")),
+        blocked_buy_regimes=_env_list("COINBASE_BLOCKED_BUY_REGIMES", "crash,bear,euphoria"),
         fee_bps=_env_decimal("COINBASE_FEE_BPS", "80"),
         slippage_bps=_env_decimal("COINBASE_SLIPPAGE_BPS", "10"),
         sell_base_size=Decimal(sell_size_raw) if sell_size_raw else None,
@@ -129,4 +139,5 @@ def load_config(env_path: str = "coinbase.env") -> BotConfig:
         paper_ledger_path=os.getenv("PAPER_TRADING_LEDGER_PATH", "paper_trades.jsonl").strip(),
         paper_starting_usd=_env_decimal("PAPER_TRADING_STARTING_USD", "1000.00"),
         paper_starting_base=_env_decimal("PAPER_TRADING_STARTING_BASE", "0"),
+        journal_path=os.getenv("SIGMA_JOURNAL_PATH", "journal.md").strip(),
     )

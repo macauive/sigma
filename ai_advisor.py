@@ -34,7 +34,8 @@ class AIAdvisor:
                 instructions=(
                     "You are a cautious crypto trading risk analyst. "
                     "You may only return JSON. Never recommend leverage. "
-                    "Prefer HOLD unless the edge is explicit after fees and risk."
+                    "Prefer HOLD unless the edge is explicit after fees and risk. "
+                    "Do not ignore blocked regimes, loss limits, or position caps."
                 ),
                 input=json.dumps(payload, separators=(",", ":")),
                 text={
@@ -78,9 +79,13 @@ class AIAdvisor:
             "risk_limits": {
                 "quote_trade_size_usd": str(self.config.quote_trade_size_usd),
                 "max_trade_size_usd": str(self.config.max_trade_size_usd),
+                "max_position_exposure_pct": str(self.config.max_position_exposure_pct),
                 "max_trades_per_day": self.config.max_trades_per_day,
+                "blocked_buy_regimes": list(self.config.blocked_buy_regimes),
             },
             "indicators": snapshot.indicators,
+            "regime": baseline.metadata.get("regime", "unknown"),
+            "strategy": baseline.metadata.get("strategy", "unknown"),
             "baseline_signal": {
                 "action": baseline.action,
                 "confidence": baseline.confidence,
@@ -106,6 +111,11 @@ class AIAdvisor:
         if action not in {"BUY", "SELL", "HOLD"}:
             action = "HOLD"
         confidence = max(0.0, min(1.0, confidence))
+
+        if baseline.action == "HOLD" and action != "HOLD":
+            action = "HOLD"
+        if baseline.action == "SELL" and action == "BUY":
+            action = "HOLD"
 
         quote_size = baseline.quote_size
         if action == "HOLD":

@@ -13,6 +13,7 @@ from paper_trading import PaperTradingLedger
 from portfolio import PortfolioGuard
 from risk import RiskManager
 from strategy import RuleBasedStrategy
+from trading_journal import TradingJournal
 
 
 def _json_default(value):
@@ -32,6 +33,7 @@ class TradingBot:
         self.strategy = RuleBasedStrategy(self.config)
         self.advisor = AIAdvisor(self.config)
         self.risk = RiskManager(self.config)
+        self.journal = TradingJournal(self.config.journal_path)
         self.paper_ledger = (
             PaperTradingLedger(
                 path=self.config.paper_ledger_path,
@@ -62,6 +64,8 @@ class TradingBot:
                 portfolio_decision = PortfolioGuard(
                     balances=self.broker.get_balances(),
                     product_limits=self.broker.get_product_limits(decision.signal.product_id),
+                    mark_price=snapshot.current_price,
+                    max_position_exposure_pct=self.config.max_position_exposure_pct,
                 ).evaluate(decision)
                 if portfolio_decision.allowed:
                     result = self.broker.submit_market_order(portfolio_decision.signal)
@@ -82,6 +86,7 @@ class TradingBot:
             "dry_run": self.config.dry_run,
             "ai_enabled": self.advisor.enabled,
         }
+        self.journal.append(event)
         print(json.dumps(event, default=_json_default, indent=2))
         return event
 
